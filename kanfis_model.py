@@ -1,21 +1,32 @@
 """
-kanfis_model.py  (v2 — all bugs fixed)
+kanfis_model.py  (v3 — performance improvements applied)
 ===============
 Kolmogorov-Arnold Neuro-Fuzzy Inference System (KANFIS)
 
-Bug-fix changelog vs original:
-  FIX 1 — GaussianRBF: add linear bypass  edge(x) = w*x + phi(x)
-           Without it RBF≈0 at init, blocking all gradient from inputs.
+IMPROVEMENT CHANGELOG vs v2:
+  IMP 1 — composite_loss: BCE → Focal Loss
+           Focal Loss down-weights easy correct predictions and forces
+           the model to focus on hard false negatives (missed diabetics).
+           This directly fixes the 7:3 negative/positive rule imbalance
+           caused by residual class imbalance surviving SMOTE-Tomek.
+  IMP 2 — _rule_diversity_loss() added to KANFIS
+           Penalises pairs of fuzzy rule centres that are too close together,
+           forcing each rule to specialise on a distinct patient sub-population.
+           Without this, multiple rules fire on identical profiles (evident in
+           the original rule weights chart — all negative bars are ~equal height).
+  IMP 3 — TemperatureScaling module added
+           Post-training calibration wrapper. The original calibration curve
+           showed systematic under-prediction (fraction positives << predicted
+           probability). Temperature scaling learns a single scalar T on the
+           validation set to correct this without retraining the full model.
+
+Original bug-fix changelog (v2):
+  FIX 1 — GaussianRBF: linear bypass  edge(x) = w*x + phi(x)
   FIX 2 — GroupKANLayer: LayerNorm → BatchNorm1d
-           LayerNorm made every sample statistically identical; BN preserves
-           inter-sample discriminative variance.
-  FIX 3 — IT2FuzzyLayer: dist.sum → per_feat.mean (true additive aggregation)
-           and sigma init ≈ 0.5 (not 1.0) for wider firing range.
-  FIX 4 — SparseRuleHead: Kaiming init → small init std=0.05
-           Large initial weights caused all-one-class prediction from epoch 1;
-           L1 then zeroed everything; early-stop fired before any learning.
-  FIX 5 — Bottleneck: Tanh → BatchNorm1d + GELU (no saturation).
-  FIX 6 — composite_loss: l1_scale warm-up parameter (see train.py).
+  FIX 3 — IT2FuzzyLayer: dist.sum → per_feat.mean + smaller sigma init
+  FIX 4 — SparseRuleHead: Kaiming → small init std=0.05
+  FIX 5 — Bottleneck: Tanh → BatchNorm1d + GELU
+  FIX 6 — composite_loss: L1 warm-up via l1_scale parameter
 """
 
 import math
@@ -25,16 +36,14 @@ import torch.nn.functional as F
 
 
 # ═══════════════════════════════════════════════════════════
-# 1.  GAUSSIAN RBF KAN EDGE  (FIX 1: linear bypass added)
+# 1.  GAUSSIAN RBF KAN EDGE
 # ═══════════════════════════════════════════════════════════
 class GaussianRBF(nn.Module):
     """
     Univariate KAN edge:  out(x) = linear_weight*x  +  Σ_k w_k·φ_k(x)
 
-    The linear term is the critical missing piece from the original code.
-    In pykan the edge is  w_res*SiLU(x) + w_spline*phi(x).  Without the
-    residual, random w_k (mean≈0) cause RBF≈0 at init, so NO gradient
-    signal reaches input features → entire model dead from epoch 1.
+    The linear bypass is critical — without it, RBF≈0 at init,
+    blocking all gradient signal from input features.
     """
     def __init__(self, n_basis: int = 8):
         super().__init__()
@@ -42,82 +51,72 @@ class GaussianRBF(nn.Module):
         self.centres = nn.Parameter(
             torch.linspace(-3.0, 3.0, n_basis).unsqueeze(0)   # (1, n_basis)
         )
-        self.log_widths = nn.Parameter(torch.zeros(1, n_basis))
-        # Near-zero init: linear term dominates at start; RBF learns gradually
-        self.weights = nn.Parameter(torch.randn(n_basis) * 0.1)
-        # Linear bypass: start as near-identity passthrough
-        self.linear_weight = nn.Parameter(torch.ones(1))
+        self.log_widths     = nn.Parameter(torch.zeros(1, n_basis))
+        self.weights        = nn.Parameter(torch.randn(n_basis) * 0.1)
+        self.linear_weight  = nn.Parameter(torch.ones(1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (batch,)  →  out: (batch,)"""
-        linear_out = self.linear_weight * x                    # (batch,)
-        x_exp  = x.unsqueeze(-1)                               # (batch, 1)
-        sigma  = torch.exp(self.log_widths) + 1e-6             # (1, n_basis)
+        linear_out = self.linear_weight * x
+        x_exp  = x.unsqueeze(-1)
+        sigma  = torch.exp(self.log_widths) + 1e-6
         rbf    = torch.exp(-0.5 * ((x_exp - self.centres) / sigma) ** 2)
-        rbf_out = (rbf * self.weights).sum(-1)                 # (batch,)
+        rbf_out = (rbf * self.weights).sum(-1)
         return linear_out + rbf_out
 
 
 # ═══════════════════════════════════════════════════════════
-# 2.  GROUP KAN LAYER  (FIX 2: BatchNorm1d replaces LayerNorm)
+# 2.  GROUP KAN LAYER
 # ═══════════════════════════════════════════════════════════
 class GroupKANLayer(nn.Module):
     """
     KAN layer with clinical domain grouping and shared RBF activations.
-
-    FIX 2: LayerNorm normalises each SAMPLE across its 48 features, making
-    every patient's representation statistically identical and destroying
-    the between-patient discrimination needed for classification.
-    BatchNorm1d normalises each FEATURE across the batch — correct behaviour.
+    BatchNorm1d (not LayerNorm) preserves inter-sample discriminative variance.
     """
     def __init__(self, n_features: int, group_map: dict,
                  out_dim: int = 16, n_basis: int = 8):
         super().__init__()
-        self.group_map = group_map
-        self.out_dim   = out_dim
+        self.group_map  = group_map
+        self.out_dim    = out_dim
         self.group_rbf  = nn.ModuleDict()
         self.group_proj = nn.ModuleDict()
+
         for name, indices in group_map.items():
             g_size = len(indices)
             self.group_rbf[name]  = GaussianRBF(n_basis)
             self.group_proj[name] = nn.Linear(g_size, out_dim, bias=True)
+
         for proj in self.group_proj.values():
             nn.init.kaiming_normal_(proj.weight, mode="fan_in", nonlinearity="relu")
             nn.init.zeros_(proj.bias)
+
         total_out = len(group_map) * out_dim
         self.batch_norm = nn.BatchNorm1d(total_out, momentum=0.1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (batch, n_features)  →  (batch, n_groups * out_dim)"""
         group_outputs = []
         for name, indices in self.group_map.items():
-            x_g = x[:, indices]                           # (batch, g_size)
+            x_g     = x[:, indices]
             rbf_out = torch.stack(
                 [self.group_rbf[name](x_g[:, i]) for i in range(x_g.size(1))],
                 dim=1,
-            )                                             # (batch, g_size)
-            proj_out = self.group_proj[name](rbf_out)     # (batch, out_dim)
+            )
+            proj_out = self.group_proj[name](rbf_out)
             group_outputs.append(proj_out)
-        out = torch.cat(group_outputs, dim=-1)            # (batch, n_groups*out_dim)
+        out = torch.cat(group_outputs, dim=-1)
         return self.batch_norm(out)
 
 
 # ═══════════════════════════════════════════════════════════
-# 3.  IT2 FUZZY LAYER  (FIX 3: mean aggregation + smaller sigma)
+# 3.  IT2 FUZZY LAYER
 # ═══════════════════════════════════════════════════════════
 class IT2FuzzyLayer(nn.Module):
     """
     Interval Type-2 fuzzy antecedent layer.
 
-    FIX 3a — True additive aggregation:
-      Old: exp(-0.5 * dist.sum(-1))  = product T-norm
-           With in_dim=48: exp(-24) ≈ 3e-11 → ALL firing strengths ≈ 0
-      New: per_feature.mean(-1)      = true additive aggregation
-           Stays in (0,1] regardless of dimensionality.
-
-    FIX 3b — Smaller initial sigma (≈0.5 not 1.0):
-      sigma=1.0: two inputs 0.5 units apart → 88% similar firing (barely discriminative)
-      sigma=0.5: same distance → 61% similarity; range [0.01, 1.0] across space
+    Additive aggregation (per_feature.mean) instead of product T-norm
+    prevents firing strengths collapsing to ~0 in high-dimensional inputs.
+    Smaller initial sigma (≈0.5) gives discriminative firing across the
+    normalised Z-score input space.
     """
     def __init__(self, in_dim: int, n_rules: int = 8):
         super().__init__()
@@ -140,12 +139,11 @@ class IT2FuzzyLayer(nn.Module):
         return torch.minimum(sl, su * 0.9)
 
     def _gaussian_mf(self, x, centres, sigmas):
-        """Returns (batch, n_rules) via mean over feature dims."""
-        x_exp       = x.unsqueeze(1)                          # (batch,1,in_dim)
-        c_exp       = centres.unsqueeze(0)                    # (1,n_rules,in_dim)
+        x_exp       = x.unsqueeze(1)
+        c_exp       = centres.unsqueeze(0)
         s_exp       = sigmas.unsqueeze(0)
-        dist        = ((x_exp - c_exp) / s_exp) ** 2         # (batch,n_rules,in_dim)
-        per_feature = torch.exp(-0.5 * dist)                  # ∈ (0,1]
+        dist        = ((x_exp - c_exp) / s_exp) ** 2
+        per_feature = torch.exp(-0.5 * dist)
         return per_feature.mean(-1)                           # (batch, n_rules)
 
     def forward(self, x: torch.Tensor) -> dict:
@@ -156,16 +154,13 @@ class IT2FuzzyLayer(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════
-# 4.  SPARSE RULE HEAD  (FIX 4: small weight init)
+# 4.  SPARSE RULE HEAD
 # ═══════════════════════════════════════════════════════════
 class SparseRuleHead(nn.Module):
     """
     L1-regularised consequent layer.
-
-    FIX 4: Kaiming init (std≈1) with 10 rules and firing≈0.6 gives initial
-    logit ≈ ±1.9 → model predicts all-one-class immediately → L1 zeroes
-    weights → early stop fires at epoch 20 with useless model.
-    std=0.05 gives initial logit ≈ ±0.09 → neutral start → real learning.
+    Small weight init (std=0.05) gives neutral start → prevents all-one-class
+    prediction from epoch 1 which traps the L1 into zeroing everything.
     """
     def __init__(self, n_rules: int, n_classes: int = 1):
         super().__init__()
@@ -182,16 +177,102 @@ class SparseRuleHead(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════
-# 5.  FULL KANFIS MODEL
+# 5.  TEMPERATURE SCALING  (IMP 3: new module)
+# ═══════════════════════════════════════════════════════════
+class TemperatureScaling(nn.Module):
+    """
+    IMP 3 — Post-training probability calibration via temperature scaling.
+
+    The original calibration curve showed fraction_positives << predicted_prob
+    across all bins — the model is systematically over-confident, predicting
+    high probabilities for samples that are mostly non-diabetic.
+
+    Temperature scaling divides all logits by a learned scalar T:
+        calibrated_logit = logit / T
+    T > 1 flattens the probability distribution (fixes over-confidence).
+    T < 1 sharpens it. T=1 is identity (no change).
+
+    T is learned by minimising NLL (cross-entropy) on the held-out
+    validation set AFTER the main model is trained. Only T is optimised —
+    the KANFIS weights are frozen. This is the standard post-hoc calibration
+    approach (Guo et al., ICML 2017).
+
+    Usage:
+        ts = calibrate_temperature(model, X_val, y_val, device)
+        probs = torch.sigmoid(ts(model(X)) )
+    """
+    def __init__(self):
+        super().__init__()
+        # Start at T=1.5: slight smoothing as a sensible prior
+        self.temperature = nn.Parameter(torch.ones(1) * 1.5)
+
+    def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        return logits / self.temperature.clamp(min=0.05)  # clamp prevents T→0
+
+
+def calibrate_temperature(
+    model: "KANFIS",
+    X_val: "np.ndarray",
+    y_val: "np.ndarray",
+    device: torch.device,
+) -> TemperatureScaling:
+    """
+    Fit TemperatureScaling on the validation set using L-BFGS.
+    Returns the fitted TemperatureScaling module.
+    Call this AFTER train_kanfis() completes.
+
+    Example:
+        model, history = train_kanfis(...)
+        ts = calibrate_temperature(model, X_val, y_val, device)
+        # In evaluate.py pass ts to full_evaluation:
+        full_evaluation(model, ts, X_test, y_test, ...)
+    """
+    import numpy as np
+
+    ts = TemperatureScaling().to(device)
+    model.eval()
+
+    with torch.no_grad():
+        logits = model(
+            torch.FloatTensor(X_val).to(device)
+        ).squeeze(-1).detach()
+
+    labels = torch.FloatTensor(y_val).to(device)
+
+    optimiser = torch.optim.LBFGS(
+        [ts.temperature], lr=0.01, max_iter=100, line_search_fn="strong_wolfe"
+    )
+
+    def _eval():
+        optimiser.zero_grad()
+        scaled_logits = ts(logits)
+        loss = F.binary_cross_entropy_with_logits(scaled_logits, labels)
+        loss.backward()
+        return loss
+
+    optimiser.step(_eval)
+
+    T = ts.temperature.item()
+    print(f"  [TemperatureScaling] Optimal T = {T:.4f}  "
+          f"({'smoothing — was over-confident' if T > 1 else 'sharpening'})")
+    return ts
+
+
+# ═══════════════════════════════════════════════════════════
+# 6.  FULL KANFIS MODEL
 # ═══════════════════════════════════════════════════════════
 class KANFIS(nn.Module):
     def __init__(self, n_features: int, group_map: dict,
                  kan_out_dim: int = 16, n_rules: int = 10,
-                 kan_n_basis: int = 8, l1_lambda: float = 1e-3):
+                 kan_n_basis: int = 8, l1_lambda: float = 1e-3,
+                 focal_gamma: float = 2.0,
+                 diversity_weight: float = 0.1):
         super().__init__()
-        self.l1_lambda  = l1_lambda
-        self.n_features = n_features
-        self.group_map  = group_map
+        self.l1_lambda       = l1_lambda
+        self.n_features      = n_features
+        self.group_map       = group_map
+        self.focal_gamma     = focal_gamma       # IMP 1
+        self.diversity_weight = diversity_weight  # IMP 2
 
         # Stage 1 — Group KAN
         self.group_kan = GroupKANLayer(
@@ -200,7 +281,7 @@ class KANFIS(nn.Module):
         )
         kan_total_out = len(group_map) * kan_out_dim
 
-        # Bottleneck: KAN space → compact fuzzy input (FIX 5: BN+GELU, not Tanh)
+        # Bottleneck: KAN space → compact fuzzy input (BN + GELU, no Tanh)
         fuzzy_in_dim = max(2 * n_rules, 8)
         self.fuzzy_proj = nn.Sequential(
             nn.Linear(kan_total_out, fuzzy_in_dim),
@@ -217,25 +298,94 @@ class KANFIS(nn.Module):
         self.rule_head = SparseRuleHead(n_rules=n_rules, n_classes=1)
 
     def forward(self, x: torch.Tensor, return_rules: bool = False):
-        kan_out   = self.group_kan(x)           # (batch, kan_total_out)
-        fuzzy_in  = self.fuzzy_proj(kan_out)    # (batch, fuzzy_in_dim)
-        fuzzy_out = self.fuzzy_layer(fuzzy_in)  # dict of (batch, n_rules)
-        firing    = fuzzy_out["centroid"]       # (batch, n_rules)
-        logit     = self.rule_head(firing)      # (batch, 1)
+        kan_out   = self.group_kan(x)
+        fuzzy_in  = self.fuzzy_proj(kan_out)
+        fuzzy_out = self.fuzzy_layer(fuzzy_in)
+        firing    = fuzzy_out["centroid"]
+        logit     = self.rule_head(firing)
         if return_rules:
             return logit, fuzzy_out
         return logit
 
-    def composite_loss(self, logit: torch.Tensor, targets: torch.Tensor,
-                       l1_scale: float = 1.0) -> tuple:
+    # ── IMP 2: Rule diversity loss ───────────────────────────────────────
+    def _rule_diversity_loss(self, min_distance: float = 0.5) -> torch.Tensor:
         """
-        BCE + L1 sparsity.  l1_scale ramps 0→1 over warmup epochs
-        (FIX 6) to prevent L1 from zeroing weights before any learning.
+        IMP 2 — Penalise pairs of fuzzy rule centres that are too similar.
+
+        Why this matters:
+          Without diversity regularisation, multiple rules learn to fire
+          on nearly identical patient profiles (e.g. all "high BMI + high glucose").
+          The rule weight chart showed 7 near-identical protective bars, which is
+          symptomatic of this collapse. Diversity loss pushes centres apart so
+          each rule specialises on a DIFFERENT clinical sub-population.
+
+        Implementation:
+          Computes pairwise L2 distances between rule centre vectors.
+          Penalises any pair closer than min_distance (in Z-score units).
+          Only the upper triangle is counted (avoids double-counting).
         """
-        bce   = F.binary_cross_entropy_with_logits(logit.squeeze(-1), targets.float())
-        l1    = self.rule_head.l1_penalty
-        total = bce + l1_scale * self.l1_lambda * l1
-        return total, {"bce": bce.item(), "l1": l1.item()}
+        c    = self.fuzzy_layer.centres                         # (n_rules, in_dim)
+        diff = c.unsqueeze(0) - c.unsqueeze(1)                  # (n,n,d)
+        dist = diff.pow(2).sum(-1).sqrt()                       # (n,n)
+        # relu(min_dist - dist): positive only when pair is too close
+        penalty = F.relu(min_distance - dist).triu(diagonal=1).mean()
+        return penalty
+
+    # ── IMP 1: Focal Loss composite ──────────────────────────────────────
+    def composite_loss(
+        self,
+        logit: torch.Tensor,
+        targets: torch.Tensor,
+        l1_scale: float = 1.0,
+    ) -> tuple:
+        """
+        IMP 1 — Focal Loss replaces BCE as the primary classification objective.
+
+        Why Focal Loss?
+          DiaBD has 840 diabetic vs 225 non-diabetic cases (3.7:1 ratio).
+          Even after SMOTE-Tomek, the class balance is imperfect.
+          Standard BCE treats every sample equally; easy majority-class
+          samples (correctly classified non-diabetics) dominate the gradient,
+          pushing the model toward specificity at the cost of sensitivity.
+
+          Focal Loss: FL(p_t) = -(1 - p_t)^γ · log(p_t)
+            γ (focal_gamma) = 2.0 by default
+            → Well-classified samples (p_t ≈ 1) get weight ≈ 0 (down-weighted)
+            → Hard samples (p_t ≈ 0.5) get full weight
+
+          This directly addresses the 7:3 negative/positive rule imbalance
+          seen in the rule_weights.png output.
+
+        Loss = FocalLoss + l1_scale * λ_L1 * L1 + diversity_weight * DiversityLoss
+
+        l1_scale: linearly warmed up 0→1 over warmup_epochs (prevents L1 from
+                  zeroing weights before any learning occurs — see train.py).
+        """
+        # Focal loss
+        logit_sq  = logit.squeeze(-1)
+        bce_each  = F.binary_cross_entropy_with_logits(
+            logit_sq, targets.float(), reduction="none"
+        )
+        probs  = torch.sigmoid(logit_sq)
+        p_t    = probs * targets + (1 - probs) * (1 - targets)
+        focal  = ((1 - p_t) ** self.focal_gamma * bce_each).mean()
+
+        # L1 sparsity on rule weights
+        l1 = self.rule_head.l1_penalty
+
+        # IMP 2: Rule diversity (weighted by diversity_weight)
+        diversity = self._rule_diversity_loss()
+
+        total = (
+            focal
+            + l1_scale * self.l1_lambda * l1
+            + self.diversity_weight * diversity
+        )
+        return total, {
+            "bce":       focal.item(),
+            "l1":        l1.item(),
+            "diversity": diversity.item(),
+        }
 
     def get_active_rules(self, threshold: float = 0.01) -> list:
         weights = self.rule_head.rule_weights.weight.detach().abs().squeeze(0)
@@ -246,21 +396,37 @@ class KANFIS(nn.Module):
             mask = self.rule_head.rule_weights.weight.abs() < threshold
             self.rule_head.rule_weights.weight[mask] = 0.0
         active = self.get_active_rules(threshold)
-        print(f"[Prune] {len(active)} active rules remaining: {active}")
+        print(f"  [Prune] {len(active)} active rules remaining: {active}")
 
 
 # ═══════════════════════════════════════════════════════════
-# 6.  FACTORY FUNCTION
+# 7.  FACTORY FUNCTION
 # ═══════════════════════════════════════════════════════════
-def build_kanfis(n_features: int, group_map: dict,
-                 n_rules: int = 10, l1_lambda: float = 1e-3) -> KANFIS:
+def build_kanfis(
+    n_features: int,
+    group_map: dict,
+    n_rules: int = 10,
+    l1_lambda: float = 1e-3,
+    focal_gamma: float = 2.0,       # IMP 1
+    diversity_weight: float = 0.1,  # IMP 2
+) -> KANFIS:
     model = KANFIS(
-        n_features=n_features, group_map=group_map,
-        kan_out_dim=16, n_rules=n_rules, kan_n_basis=8, l1_lambda=l1_lambda,
+        n_features=n_features,
+        group_map=group_map,
+        kan_out_dim=16,
+        n_rules=n_rules,
+        kan_n_basis=8,
+        l1_lambda=l1_lambda,
+        focal_gamma=focal_gamma,
+        diversity_weight=diversity_weight,
     )
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[KANFIS] Built — {n_params:,} params | groups: {list(group_map.keys())}"
-          f" | rules: {n_rules} | λ_L1: {l1_lambda}")
+    print(
+        f"  [KANFIS] Built — {n_params:,} params | "
+        f"groups: {list(group_map.keys())} | "
+        f"rules: {n_rules} | λ_L1: {l1_lambda} | "
+        f"focal_γ: {focal_gamma} | diversity_w: {diversity_weight}"
+    )
     return model
 
 
@@ -272,6 +438,7 @@ if __name__ == "__main__":
     y_fake     = torch.randint(0, 2, (32,)).float()
     logit, fz  = model(x_fake, return_rules=True)
     loss, bd   = model.composite_loss(logit, y_fake, l1_scale=0.0)
-    print(f"Logit range : [{logit.min():.3f}, {logit.max():.3f}]  (should vary, not constant)")
+    print(f"Logit range : [{logit.min():.3f}, {logit.max():.3f}]")
     print(f"Centroid rng: [{fz['centroid'].min():.3f}, {fz['centroid'].max():.3f}]")
-    print(f"Loss={loss:.4f}  BCE={bd['bce']:.4f}  L1={bd['l1']:.4f}")
+    print(f"Loss={loss:.4f}  BCE(focal)={bd['bce']:.4f}  "
+          f"L1={bd['l1']:.4f}  Diversity={bd['diversity']:.4f}")

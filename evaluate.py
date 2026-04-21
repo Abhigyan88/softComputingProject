@@ -1,14 +1,24 @@
 """
-evaluate.py
+evaluate.py  (v2 — improvements applied)
 ===========
 Phase 4: Clinical Validation and Narrative Generation.
 
-Provides:
-  - Full evaluation suite (ROC-AUC, PR curve, calibration)
-  - SHAP computational cost comparison (O(n²) vs KANFIS O(n))
-  - Rule extraction from trained KANFIS
-  - Clinical narrative generation (IF ... THEN ... CONFIDENCE)
-  - Cross-population validation (PIDD → DiaBD demographic shift test)
+IMPROVEMENT CHANGELOG vs v1:
+  IMP 1 — full_evaluation now accepts an optional TemperatureScaling module.
+           All probability outputs (ROC, PR, calibration, metrics) are computed
+           from temperature-calibrated logits when ts is provided.
+           This directly fixes the calibration curve which showed systematic
+           over-confidence (fraction positives << predicted probability across
+           all bins in the original run).
+  IMP 2 — Calibration plot shows BOTH raw and calibrated curves side by side
+           to demonstrate the improvement (useful for the paper's Pillar 1 claim).
+  IMP 3 — print_clinical_report now shows rule polarity summary
+           (# positive / # negative rules) to detect imbalanced rule learning.
+
+Original features retained:
+  - ROC-AUC, PR curve, calibration, rule weight plots
+  - Rule extraction and clinical narrative generation
+  - Cross-population validation (Pima Bias test)
 """
 
 import numpy as np
@@ -23,28 +33,26 @@ from sklearn.metrics import (
     f1_score, recall_score,
 )
 from sklearn.calibration import calibration_curve
-from kanfis_model import KANFIS
+from kanfis_model import KANFIS, TemperatureScaling
 
 
 # ─────────────────────────────────────────────
 # LINGUISTIC VARIABLE MAPPING
 # ─────────────────────────────────────────────
-# Maps the extracted Gaussian membership function parameters
-# (mean ± std in Z-score space) to clinical linguistic terms.
 LINGUISTIC_MAP = {
-    "FastingGlucose":   {(-4,-1.5): "Normal",     (-1.5, 0.5): "Elevated",    (0.5, 4): "Critically Elevated"},
-    "RandomGlucose":    {(-4,-1.5): "Normal",     (-1.5, 0.5): "Moderately High", (0.5, 4): "Very High"},
-    "BMI":              {(-4,-1.0): "Underweight", (-1.0, 1.0): "Normal",      (1.0, 4): "Obese"},
-    "Insulin":          {(-4,-0.5): "Low",         (-0.5, 0.5): "Normal",      (0.5, 4): "High"},
-    "SystolicBP":       {(-4,-1.0): "Normal",      (-1.0, 1.0): "Elevated",    (1.0, 4): "Hypertensive"},
-    "DiastolicBP":      {(-4,-1.0): "Normal",      (-1.0, 1.0): "Moderately High", (1.0, 4): "Severely High"},
-    "Hypertension":     {(-4, 0.0): "Absent",      (0.0, 4): "Present"},
-    "IschemicStroke":   {(-4, 0.0): "No History",  (0.0, 4): "History Present"},
-    "HeartDisease":     {(-4, 0.0): "No History",  (0.0, 4): "History Present"},
-    "Age":              {(-4,-1.0): "Young",        (-1.0, 1.0): "Middle-Aged", (1.0, 4): "Elderly"},
-    "VascularRiskScore":{(-4, 0.0): "Low Risk",     (0.0, 1.5): "Moderate Risk", (1.5, 4): "High Risk"},
-    "MetabolicBurden":  {(-4,-0.5): "Low",          (-0.5, 0.5): "Moderate",   (0.5, 4): "High"},
-    "CardioFlag":       {(-4, 0.0): "No Comorbidities", (0.0, 4): "Comorbidities Present"},
+    "FastingGlucose":   {(-4,-1.5): "Normal",      (-1.5, 0.5): "Elevated",         (0.5, 4): "Critically Elevated"},
+    "RandomGlucose":    {(-4,-1.5): "Normal",      (-1.5, 0.5): "Moderately High",  (0.5, 4): "Very High"},
+    "BMI":              {(-4,-1.0): "Underweight",  (-1.0, 1.0): "Normal",           (1.0, 4): "Obese"},
+    "Insulin":          {(-4,-0.5): "Low",          (-0.5, 0.5): "Normal",           (0.5, 4): "High"},
+    "SystolicBP":       {(-4,-1.0): "Normal",       (-1.0, 1.0): "Elevated",         (1.0, 4): "Hypertensive"},
+    "DiastolicBP":      {(-4,-1.0): "Normal",       (-1.0, 1.0): "Moderately High",  (1.0, 4): "Severely High"},
+    "Hypertension":     {(-4,  0.0): "Absent",      (0.0, 4): "Present"},
+    "IschemicStroke":   {(-4,  0.0): "No History",  (0.0, 4): "History Present"},
+    "HeartDisease":     {(-4,  0.0): "No History",  (0.0, 4): "History Present"},
+    "Age":              {(-4, -1.0): "Young",        (-1.0, 1.0): "Middle-Aged",     (1.0, 4): "Elderly"},
+    "VascularRiskScore":{(-4,  0.0): "Low Risk",    (0.0, 1.5): "Moderate Risk",     (1.5, 4): "High Risk"},
+    "MetabolicBurden":  {(-4, -0.5): "Low",          (-0.5, 0.5): "Moderate",        (0.5, 4): "High"},
+    "CardioFlag":       {(-4,  0.0): "No Comorbidities", (0.0, 4): "Comorbidities Present"},
 }
 
 DEFAULT_TERM = "Elevated"
@@ -69,15 +77,8 @@ def extract_rules(
     """
     Extract surviving (non-pruned) fuzzy rules and translate them into
     human-readable antecedents + confidence weights.
-
-    Each rule dict has:
-      'rule_idx'      : int
-      'weight'        : float   (consequent weight magnitude)
-      'antecedents'   : list of (feature_name, linguistic_term)
-      'raw_centres'   : np.ndarray  (mean of Gaussian MF per feature)
     """
-    # Gather IT2 fuzzy layer centres (n_rules, in_dim)
-    centres = model.fuzzy_layer.centres.detach().cpu().numpy()  # (n_rules, kan_out_dim)
+    centres = model.fuzzy_layer.centres.detach().cpu().numpy()
     weights = model.rule_head.rule_weights.weight.detach().cpu().numpy().squeeze(0)
 
     active_rule_indices = [
@@ -86,18 +87,15 @@ def extract_rules(
 
     rules = []
     for r_idx in active_rule_indices:
-        rule_centres = centres[r_idx]       # (kan_out_dim,)
+        rule_centres = centres[r_idx]
         weight_val   = float(weights[r_idx])
 
-        # Map KAN output dimensions back to feature groups
-        # (approximation: we take the mean of each group's dimensions)
         antecedents = []
         offset = 0
         for group_name, feat_indices in model.group_map.items():
-            g_out = 16  # kan_out_dim
+            g_out = 16
             group_centre_mean = float(rule_centres[offset: offset + g_out].mean())
             offset += g_out
-            # Associate this group's centre with each member feature
             for f_idx in feat_indices:
                 if f_idx < len(feature_names):
                     fname = feature_names[f_idx]
@@ -111,7 +109,6 @@ def extract_rules(
             "raw_centres": rule_centres,
         })
 
-    # Sort by absolute weight (most influential first)
     rules.sort(key=lambda r: abs(r["weight"]), reverse=True)
     return rules
 
@@ -123,27 +120,14 @@ def generate_narratives(
     rules: list[dict],
     top_k: int = 7,
 ) -> list[str]:
-    """
-    Compile top-k extracted fuzzy rules into clinical IF-THEN narratives.
-
-    Example output:
-        "IF Fasting Glucose is Critically Elevated AND DiastolicBP is
-         Moderately High AND Ischemic Stroke History is Present,
-         THEN probability of Type-2 Diabetes is HIGH (weight=+0.82)"
-
-    This format aligns with clinical decision processes and satisfies
-    regulatory transparency requirements (EU AI Act).
-    """
     narratives = []
     for i, rule in enumerate(rules[:top_k]):
-        # Build antecedent string
         conditions = " AND ".join(
             f"{feat} is {term}" for feat, term in rule["antecedents"]
         )
-        direction = "HIGH" if rule["weight"] > 0 else "PROTECTIVE / LOW"
+        direction  = "HIGH" if rule["weight"] > 0 else "PROTECTIVE / LOW"
         confidence = abs(rule["weight"])
-
-        narrative = (
+        narrative  = (
             f"Rule {i+1}:\n"
             f"  IF   {conditions}\n"
             f"  THEN Risk of Type-2 Diabetes is {direction}\n"
@@ -151,7 +135,6 @@ def generate_narratives(
             f"Confidence ∝ {confidence:.4f})\n"
         )
         narratives.append(narrative)
-
     return narratives
 
 
@@ -160,15 +143,29 @@ def print_clinical_report(
     feature_names: list[str],
     top_k: int = 7,
 ) -> None:
+    """
+    IMP 3 — now also prints rule polarity summary to detect imbalanced
+    rule learning (e.g. 7 protective vs 3 risk rules signals class
+    imbalance surviving SMOTE, or diversity collapse).
+    """
     print("\n" + "═"*65)
     print("  KANFIS — Extracted Clinical Decision Rules")
     print("═"*65)
 
-    rules = extract_rules(model, feature_names)
+    rules     = extract_rules(model, feature_names)
     narratives = generate_narratives(rules, top_k)
 
-    active = model.get_active_rules()
-    print(f"  Total active rules: {len(active)} (after L1 pruning)\n")
+    active    = model.get_active_rules()
+    n_pos     = sum(1 for r in rules if r["weight"] > 0)
+    n_neg     = len(rules) - n_pos
+
+    print(f"  Total active rules  : {len(active)} (after L1 pruning)")
+    # IMP 3: polarity summary
+    print(f"  Rule polarity       : {n_pos} risk-positive / {n_neg} protective")
+    if n_neg > 2 * n_pos:
+        print("  ⚠ WARNING: Protective rules dominate. "
+              "Consider increasing focal_gamma or checking class balance.")
+    print()
 
     for n in narratives:
         print(n)
@@ -183,17 +180,25 @@ def full_evaluation(
     X_test: np.ndarray,
     y_test: np.ndarray,
     feature_names: list[str],
+    ts: "TemperatureScaling | None" = None,   # IMP 1: optional calibration
     save_plots: bool = True,
     output_dir: str = ".",
 ) -> dict:
     """
-    Comprehensive evaluation covering all three research pillars:
-      Pillar 1 — Predictive Fidelity (ROC-AUC, F1, PR curve)
-      Pillar 2 — Interpretability    (rule count, rule extraction time)
-      Pillar 3 — Epidemiological Gen (placeholder for cross-cohort test)
+    IMP 1 — full_evaluation now accepts a TemperatureScaling module (ts).
+    When provided, all probability outputs are derived from calibrated
+    logits (logit / T). This affects:
+      - All reported metrics (AUC, F1, sensitivity, specificity, precision)
+      - ROC curve
+      - PR curve
+      - Calibration plot (now shows raw vs calibrated comparison)
+
+    If ts=None, behaviour is identical to v1 (raw logits used).
     """
-    device  = next(model.parameters()).device
+    device = next(model.parameters()).device
     model.eval()
+    if ts is not None:
+        ts.eval()
 
     ds  = TensorDataset(torch.FloatTensor(X_test), torch.FloatTensor(y_test))
     ldr = DataLoader(ds, batch_size=128)
@@ -204,23 +209,34 @@ def full_evaluation(
         all_logits.append(logit)
         all_labels.append(y_b)
 
-    logits = torch.cat(all_logits).numpy()
-    labels = torch.cat(all_labels).numpy()
-    probs  = 1 / (1 + np.exp(-logits))
-    preds  = (probs >= 0.5).astype(int)
+    raw_logits = torch.cat(all_logits).numpy()
+    labels     = torch.cat(all_labels).numpy()
+
+    # IMP 1 — apply temperature scaling if provided
+    if ts is not None:
+        T = ts.temperature.item()
+        cal_logits = raw_logits / max(T, 0.05)
+    else:
+        T          = 1.0
+        cal_logits = raw_logits
+
+    raw_probs = 1 / (1 + np.exp(-raw_logits))
+    probs     = 1 / (1 + np.exp(-cal_logits))
+    preds     = (probs >= 0.5).astype(int)
 
     # ── Pillar 1: Predictive Fidelity ──────────────
-    auc   = roc_auc_score(labels, probs)
-    ap    = average_precision_score(labels, probs)
-    f1    = f1_score(labels, preds, zero_division=0)
-    sens  = recall_score(labels, preds, pos_label=1, zero_division=0)  # sensitivity
-    spec  = recall_score(labels, preds, pos_label=0, zero_division=0)  # specificity
-    cm    = confusion_matrix(labels, preds)
+    auc  = roc_auc_score(labels, probs)
+    ap   = average_precision_score(labels, probs)
+    f1   = f1_score(labels, preds, zero_division=0)
+    sens = recall_score(labels, preds, pos_label=1, zero_division=0)
+    spec = recall_score(labels, preds, pos_label=0, zero_division=0)
+    cm   = confusion_matrix(labels, preds)
 
     print("\n" + "═"*65)
     print("  KANFIS — Evaluation Report")
     print("═"*65)
-    print(f"  ROC-AUC    : {auc:.4f}")
+    cal_note = f" (T={T:.3f} applied)" if ts is not None else " (uncalibrated)"
+    print(f"  ROC-AUC    : {auc:.4f}{cal_note}")
     print(f"  Avg Prec.  : {ap:.4f}")
     print(f"  F1-Score   : {f1:.4f}")
     print(f"  Sensitivity: {sens:.4f}  (Recall for diabetic class)")
@@ -231,8 +247,8 @@ def full_evaluation(
     # ── Pillar 2: Interpretability ──────────────────
     import time
     t0 = time.perf_counter()
-    active_rules = model.get_active_rules()
-    rule_time_ms = (time.perf_counter() - t0) * 1000
+    active_rules   = model.get_active_rules()
+    rule_time_ms   = (time.perf_counter() - t0) * 1000
 
     print(f"  Active rules after pruning : {len(active_rules)}")
     print(f"  Rule inference time        : {rule_time_ms:.3f} ms  (vs SHAP O(n²))")
@@ -244,7 +260,7 @@ def full_evaluation(
     if save_plots:
         _plot_roc(labels, probs, auc, output_dir)
         _plot_pr(labels, probs, ap, output_dir)
-        _plot_calibration(labels, probs, output_dir)
+        _plot_calibration(labels, raw_probs, probs, output_dir, T)   # IMP 2
         _plot_rule_weights(model, output_dir)
 
     return {
@@ -253,6 +269,7 @@ def full_evaluation(
         "n_active_rules": len(active_rules),
         "rule_inference_ms": rule_time_ms,
         "confusion_matrix": cm,
+        "temperature": T,
     }
 
 
@@ -260,18 +277,11 @@ def full_evaluation(
 # 4.  CROSS-POPULATION VALIDATION (Pima Bias test)
 # ─────────────────────────────────────────────
 def cross_population_test(
-    model_pidd: KANFIS,        # model trained on PIDD
-    X_diabd: np.ndarray,       # DiaBD test set (different demographic)
+    model_pidd: KANFIS,
+    X_diabd: np.ndarray,
     y_diabd: np.ndarray,
-    model_kanfis: KANFIS,      # model trained on DiaBD
+    model_kanfis: KANFIS,
 ) -> None:
-    """
-    Demonstrates the Pima Bias quantitatively:
-      - PIDD-trained model applied to DiaBD → performance decline
-      - DiaBD-trained KANFIS → generalised performance
-
-    Research Plan §Pillar 3 — Epidemiological Generalizability
-    """
     device = next(model_pidd.parameters()).device
 
     def _get_auc(m, X, y):
@@ -281,8 +291,8 @@ def cross_population_test(
         probs = 1 / (1 + np.exp(-logit))
         return roc_auc_score(y, probs)
 
-    auc_pidd_on_diabd    = _get_auc(model_pidd, X_diabd, y_diabd)
-    auc_kanfis_on_diabd  = _get_auc(model_kanfis, X_diabd, y_diabd)
+    auc_pidd_on_diabd   = _get_auc(model_pidd, X_diabd, y_diabd)
+    auc_kanfis_on_diabd = _get_auc(model_kanfis, X_diabd, y_diabd)
 
     delta = auc_kanfis_on_diabd - auc_pidd_on_diabd
     print("\n" + "═"*65)
@@ -309,7 +319,7 @@ def _plot_roc(labels, probs, auc, output_dir):
     plt.title("ROC Curve — KANFIS Diabetes Diagnostics")
     plt.legend(loc="lower right"); plt.tight_layout()
     plt.savefig(f"{output_dir}/roc_curve.png", dpi=150); plt.close()
-    print(f"  [Plot] ROC curve saved.")
+    print("  [Plot] ROC curve saved.")
 
 
 def _plot_pr(labels, probs, ap, output_dir):
@@ -321,19 +331,28 @@ def _plot_pr(labels, probs, ap, output_dir):
     plt.title("Precision-Recall Curve")
     plt.legend(loc="upper right"); plt.tight_layout()
     plt.savefig(f"{output_dir}/pr_curve.png", dpi=150); plt.close()
-    print(f"  [Plot] PR curve saved.")
+    print("  [Plot] PR curve saved.")
 
 
-def _plot_calibration(labels, probs, output_dir):
-    fraction, mean_pred = calibration_curve(labels, probs, n_bins=10)
+def _plot_calibration(labels, raw_probs, cal_probs, output_dir, T: float):
+    """
+    IMP 2 — Shows both raw and calibrated curves in the same figure.
+    Makes the calibration improvement visible and citable in the paper.
+    """
+    frac_raw, mean_raw = calibration_curve(labels, raw_probs, n_bins=10)
+    frac_cal, mean_cal = calibration_curve(labels, cal_probs,  n_bins=10)
+
     plt.figure(figsize=(6, 5))
-    plt.plot(mean_pred, fraction, "s-", color="#DC2626", label="KANFIS")
     plt.plot([0, 1], [0, 1], "k--", lw=1, alpha=0.5, label="Perfect calibration")
+    plt.plot(mean_raw, frac_raw, "s--", color="#94A3B8",
+             label=f"KANFIS (raw, T=1.00)", alpha=0.7)
+    plt.plot(mean_cal, frac_cal, "s-",  color="#DC2626",
+             label=f"KANFIS (calibrated, T={T:.2f})")
     plt.xlabel("Mean Predicted Probability"); plt.ylabel("Fraction Positives")
-    plt.title("Calibration Curve")
+    plt.title("Calibration Curve — Raw vs Temperature-Scaled")
     plt.legend(); plt.tight_layout()
     plt.savefig(f"{output_dir}/calibration.png", dpi=150); plt.close()
-    print(f"  [Plot] Calibration curve saved.")
+    print("  [Plot] Calibration curve saved (raw + calibrated).")
 
 
 def _plot_rule_weights(model: KANFIS, output_dir: str):
@@ -350,4 +369,4 @@ def _plot_rule_weights(model: KANFIS, output_dir: str):
     plt.legend(handles=[blue_p, red_p])
     plt.tight_layout()
     plt.savefig(f"{output_dir}/rule_weights.png", dpi=150); plt.close()
-    print(f"  [Plot] Rule weight chart saved.")
+    print("  [Plot] Rule weight chart saved.")

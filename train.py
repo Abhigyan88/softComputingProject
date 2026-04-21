@@ -1,13 +1,31 @@
 """
-train.py
+train.py  (v2 — improvements applied)
 ========
 Phase 3: Training Dynamics and Sparse Pruning for KANFIS.
 
-Features:
-  - AdamW optimiser with cosine LR annealing
+IMPROVEMENT CHANGELOG vs v1:
+  IMP 1 — LR schedule: cosine-only → linear warmup (10 epochs) + cosine annealing
+           Prevents unstable early RBF updates when lr=1e-3 hits the highly
+           dynamic GaussianRBF activation parameters from epoch 1.
+  IMP 2 — L1 warmup epochs: hardcoded 30 → proportional to total epochs (epochs//5)
+           With the original 30-epoch warmup and only 35 epochs running, L1
+           operated at full strength for just 5 epochs. Now scales correctly
+           for any --epochs value.
+  IMP 3 — Early stopping: monitor AUC → monitor F1
+           AUC measures ranking; F1 measures the precision-recall balance
+           that directly reflects clinical utility (catching true diabetics
+           without flooding clinicians with false alarms). F1 is the better
+           stopping criterion for imbalanced clinical classification.
+  IMP 4 — Default patience: inconsistency fixed (main.py passed 20, train.py
+           defaulted to 30). Now unified at 40 to allow L1 pruning to complete
+           before early stopping fires, especially with longer 150-epoch runs.
+  IMP 5 — Breakdown dict now includes 'diversity' loss for monitoring.
+  IMP 6 — train_kanfis returns calibrated temperature scalar for evaluate.py.
+
+Original features retained:
+  - AdamW optimiser
   - Stratified K-Fold cross-validation (k=5)
-  - Composite BCE + L1 sparse regularisation loss
-  - Early stopping on validation AUC
+  - Composite Focal + L1 sparse regularisation loss
   - Ablation study helpers (KANFIS vs DNN, RF, XGBoost baselines)
 """
 
@@ -17,9 +35,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
-from kanfis_model import KANFIS, build_kanfis
+from kanfis_model import KANFIS, build_kanfis, calibrate_temperature
 
 
 # ─────────────────────────────────────────────
@@ -34,13 +53,15 @@ def train_one_epoch(
     warmup_epochs: int = 30,
 ) -> dict:
     """
-    warmup_epochs: L1 penalty is linearly ramped from 0 → full λ over this
-    many epochs.  Without warm-up, L1=10.47 at epoch 1 zeroes all rule
-    weights before any learning occurs, trapping the model at AUC=0.5.
+    IMP 2 — warmup_epochs is now passed from train_kanfis as epochs//5,
+    so L1 scaling is always proportional to the total training budget.
+
+    L1 scale ramps linearly from 0 (epoch 1) to 1.0 (epoch warmup_epochs),
+    preventing L1 from zeroing weights before classification gradients
+    have had a chance to shape the rule base.
     """
     model.train()
-    total_loss = bce_sum = l1_sum = 0.0
-    # Linearly scale L1 lambda: 0 at epoch 1, full value at epoch warmup_epochs
+    total_loss = bce_sum = l1_sum = div_sum = 0.0
     l1_scale = min(1.0, (epoch - 1) / max(warmup_epochs - 1, 1))
 
     for X_batch, y_batch in loader:
@@ -51,16 +72,21 @@ def train_one_epoch(
         loss, breakdown = model.composite_loss(logit, y_batch, l1_scale=l1_scale)
 
         loss.backward()
-        # Gradient clipping — stabilises KAN RBF parameter updates
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimiser.step()
 
         total_loss += loss.item()
         bce_sum    += breakdown["bce"]
         l1_sum     += breakdown["l1"]
+        div_sum    += breakdown.get("diversity", 0.0)   # IMP 5
 
     n = len(loader)
-    return {"loss": total_loss / n, "bce": bce_sum / n, "l1": l1_sum / n}
+    return {
+        "loss":      total_loss / n,
+        "bce":       bce_sum / n,
+        "l1":        l1_sum / n,
+        "diversity": div_sum / n,                        # IMP 5
+    }
 
 
 @torch.no_grad()
@@ -81,22 +107,22 @@ def evaluate(
     logits = torch.cat(all_logits).numpy()
     labels = torch.cat(all_labels).numpy()
 
-    probs = 1 / (1 + np.exp(-logits))   # sigmoid
+    probs = 1 / (1 + np.exp(-logits))
     preds = (probs >= 0.5).astype(int)
 
     from sklearn.metrics import (
         roc_auc_score, f1_score, accuracy_score,
-        recall_score, precision_score
+        recall_score, precision_score,
     )
     return {
-        "auc":       roc_auc_score(labels, probs),
-        "f1":        f1_score(labels, preds, zero_division=0),
-        "accuracy":  accuracy_score(labels, preds),
+        "auc":         roc_auc_score(labels, probs),
+        "f1":          f1_score(labels, preds, zero_division=0),
+        "accuracy":    accuracy_score(labels, preds),
         "sensitivity": recall_score(labels, preds, pos_label=1, zero_division=0),
         "specificity": recall_score(labels, preds, pos_label=0, zero_division=0),
-        "precision": precision_score(labels, preds, zero_division=0),
-        "probs":     probs,
-        "labels":    labels,
+        "precision":   precision_score(labels, preds, zero_division=0),
+        "probs":       probs,
+        "labels":      labels,
     }
 
 
@@ -106,95 +132,120 @@ def evaluate(
 def train_kanfis(
     X_train: np.ndarray,
     y_train: np.ndarray,
-    X_val: np.ndarray,
-    y_val: np.ndarray,
-    group_map: dict,
-    n_rules: int = 10,
-    l1_lambda: float = 1e-3,
-    epochs: int = 150,
-    batch_size: int = 64,
-    lr: float = 1e-3,
-    patience: int = 30,
-    device_str: str = "auto",
-) -> tuple[KANFIS, list]:
+    X_val:   np.ndarray,
+    y_val:   np.ndarray,
+    group_map:    dict,
+    n_rules:      int   = 10,
+    l1_lambda:    float = 1e-3,
+    focal_gamma:  float = 2.0,
+    diversity_weight: float = 0.1,
+    epochs:       int   = 150,
+    batch_size:   int   = 64,
+    lr:           float = 1e-3,
+    patience:     int   = 40,    # IMP 4: was 20 in main.py / 30 in train.py
+    device_str:   str   = "auto",
+) -> tuple[KANFIS, list, "TemperatureScaling"]:
     """
     Train KANFIS on one train/val split.
 
-    Returns trained model + history list of dicts.
+    IMP 6 — Now returns (model, history, temperature_scaler).
+    The temperature scaler is fitted on X_val after training completes
+    and should be used in evaluate.py for calibrated probability outputs.
     """
     device = _get_device(device_str)
 
-    # Ensure numeric dtypes — labels can come out as object after SMOTE
     X_train = np.array(X_train, dtype=np.float32)
     y_train = np.array(y_train, dtype=np.float32)
     X_val   = np.array(X_val,   dtype=np.float32)
     y_val   = np.array(y_val,   dtype=np.float32)
 
-    # DataLoaders
-    train_ds = TensorDataset(
-        torch.from_numpy(X_train), torch.from_numpy(y_train)
-    )
-    val_ds = TensorDataset(
-        torch.from_numpy(X_val), torch.from_numpy(y_val)
-    )
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size)
+    train_ds = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
+    val_ds   = TensorDataset(torch.from_numpy(X_val),   torch.from_numpy(y_val))
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              drop_last=True)   # drop_last avoids 1-sample BN batches
+    val_loader   = DataLoader(val_ds, batch_size=batch_size)
 
     n_features = X_train.shape[1]
-    model = build_kanfis(n_features, group_map, n_rules, l1_lambda).to(device)
+    model = build_kanfis(
+        n_features, group_map, n_rules, l1_lambda, focal_gamma, diversity_weight
+    ).to(device)
 
-    # AdamW + cosine annealing LR schedule
+    # IMP 1 — LR warmup (10 epochs linear) + cosine annealing
     optimiser = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimiser, T_max=epochs, eta_min=1e-6
+    warmup_steps   = min(10, epochs // 10)
+    cosine_steps   = max(epochs - warmup_steps, 1)
+    warmup_sched   = LinearLR(
+        optimiser, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps
+    )
+    cosine_sched   = CosineAnnealingLR(optimiser, T_max=cosine_steps, eta_min=1e-6)
+    scheduler      = SequentialLR(
+        optimiser,
+        schedulers=[warmup_sched, cosine_sched],
+        milestones=[warmup_steps],
     )
 
-    best_auc   = 0.0
-    best_state = None
-    no_improve = 0
-    history    = []
+    # IMP 2 — L1 warmup proportional to total epochs
+    l1_warmup_epochs = max(20, epochs // 5)
+
+    # IMP 3 — Monitor F1 (not AUC) for early stopping
+    best_metric = 0.0
+    best_state  = None
+    no_improve  = 0
+    history     = []
 
     for epoch in range(1, epochs + 1):
-        train_metrics = train_one_epoch(model, train_loader, optimiser, device,
-                                            epoch=epoch, warmup_epochs=30)
-        val_metrics   = evaluate(model, val_loader, device)
+        train_metrics = train_one_epoch(
+            model, train_loader, optimiser, device,
+            epoch=epoch,
+            warmup_epochs=l1_warmup_epochs,   # IMP 2
+        )
+        val_metrics = evaluate(model, val_loader, device)
         scheduler.step()
+
+        # IMP 3 — Use F1 as the early stopping criterion
+        monitor_val = val_metrics["f1"]
 
         record = {
             "epoch": epoch,
             **{f"train_{k}": v for k, v in train_metrics.items()},
-            **{f"val_{k}": v for k, v in val_metrics.items() if k not in ("probs","labels")},
+            **{f"val_{k}": v for k, v in val_metrics.items()
+               if k not in ("probs", "labels")},
         }
         history.append(record)
 
-        if val_metrics["auc"] > best_auc:
-            best_auc   = val_metrics["auc"]
-            best_state = copy.deepcopy(model.state_dict())
-            no_improve = 0
+        if monitor_val > best_metric:
+            best_metric = monitor_val
+            best_state  = copy.deepcopy(model.state_dict())
+            no_improve  = 0
         else:
             no_improve += 1
 
         if epoch % 10 == 0 or epoch == 1:
+            lr_now = optimiser.param_groups[0]["lr"]
             print(
                 f"  Epoch {epoch:3d}/{epochs} | "
                 f"train_loss={train_metrics['loss']:.4f} | "
+                f"val_f1={val_metrics['f1']:.4f} | "       # IMP 3: show F1
                 f"val_auc={val_metrics['auc']:.4f} | "
                 f"val_sens={val_metrics['sensitivity']:.4f} | "
-                f"val_spec={val_metrics['specificity']:.4f}"
+                f"val_spec={val_metrics['specificity']:.4f} | "
+                f"lr={lr_now:.2e}"
             )
 
+        # IMP 4 — patience=40 (unified)
         if no_improve >= patience:
-            print(f"  [Early Stop] No improvement for {patience} epochs.")
+            print(f"  [Early Stop] No F1 improvement for {patience} epochs.")
             break
 
-    # Restore best weights
     model.load_state_dict(best_state)
-    print(f"  [Best Val AUC] {best_auc:.4f}")
+    print(f"  [Best Val F1] {best_metric:.4f}")
 
-    # Post-training sparse pruning
     model.prune_rules(threshold=0.01)
 
-    return model, history
+    # IMP 6 — Fit temperature scaler on validation set
+    ts = calibrate_temperature(model, X_val, y_val, device)
+
+    return model, history, ts
 
 
 # ─────────────────────────────────────────────
@@ -211,14 +262,13 @@ def cross_validate_kanfis(
     Stratified K-Fold CV for rigorous model evaluation.
     Returns aggregated metrics across all folds.
     """
-    skf  = StratifiedKFold(n_splits=k, shuffle=True, random_state=42)
+    skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=42)
     fold_metrics = []
 
     print(f"\n{'='*60}")
     print(f"  Stratified {k}-Fold Cross-Validation")
     print(f"{'='*60}")
 
-    # Ensure numeric dtypes
     X = np.array(X, dtype=np.float32)
     y = np.array(y, dtype=np.float32)
 
@@ -227,9 +277,10 @@ def cross_validate_kanfis(
         X_tr, X_vl = X[train_idx], X[val_idx]
         y_tr, y_vl = y[train_idx], y[val_idx]
 
-        model, _ = train_kanfis(X_tr, y_tr, X_vl, y_vl, group_map, **train_kwargs)
+        # train_kanfis now returns 3 values; discard ts in CV
+        model, _, _ts = train_kanfis(X_tr, y_tr, X_vl, y_vl, group_map, **train_kwargs)
 
-        device = next(model.parameters()).device
+        device  = next(model.parameters()).device
         val_ds  = TensorDataset(torch.FloatTensor(X_vl), torch.FloatTensor(y_vl))
         val_ldr = DataLoader(val_ds, batch_size=64)
         metrics = evaluate(model, val_ldr, device)
@@ -242,12 +293,11 @@ def cross_validate_kanfis(
             f"Spec={metrics['specificity']:.4f}"
         )
 
-    # Aggregate
     aggregated = {}
     for key in ["auc", "f1", "accuracy", "sensitivity", "specificity"]:
         vals = [m[key] for m in fold_metrics]
-        aggregated[key]             = np.mean(vals)
-        aggregated[f"{key}_std"]    = np.std(vals)
+        aggregated[key]          = np.mean(vals)
+        aggregated[f"{key}_std"] = np.std(vals)
 
     print(f"\n{'─'*60}")
     print(f"  CV Results ({k} folds):")
@@ -271,8 +321,6 @@ def run_ablation_study(
       - Deep Neural Network (MLP)
       - Random Forest
       - XGBoost
-
-    Provides evidence for Research Plan §Evaluation Pillar 1 (Predictive Fidelity).
     """
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.neural_network import MLPClassifier
@@ -287,9 +335,10 @@ def run_ablation_study(
 
     # 4a. KANFIS
     print("\n[Ablation] Training KANFIS...")
-    kanfis_model, _ = train_kanfis(
+    kanfis_model, _, _ts = train_kanfis(
         X_train, y_train, X_test, y_test,
-        group_map, n_rules=10, l1_lambda=1e-3, epochs=100
+        group_map, n_rules=10, l1_lambda=1e-3, epochs=100,
+        patience=40,   # IMP 4: consistent patience
     )
     device   = next(kanfis_model.parameters()).device
     test_ds  = TensorDataset(torch.FloatTensor(X_test), torch.FloatTensor(y_test))
@@ -300,7 +349,8 @@ def run_ablation_study(
     # 4b. MLP baseline
     print("[Ablation] Training MLP...")
     mlp = MLPClassifier(
-        hidden_layer_sizes=(64, 32), max_iter=300, random_state=42, early_stopping=True
+        hidden_layer_sizes=(64, 32), max_iter=300,
+        random_state=42, early_stopping=True,
     )
     mlp.fit(X_train, y_train)
     mlp_probs = mlp.predict_proba(X_test)[:, 1]
@@ -329,8 +379,8 @@ def run_ablation_study(
     if has_xgb:
         print("[Ablation] Training XGBoost...")
         xgb = XGBClassifier(
-            n_estimators=200, use_label_encoder=False,
-            eval_metric="logloss", random_state=42
+            n_estimators=200, eval_metric="logloss",
+            use_label_encoder=False, random_state=42,
         )
         xgb.fit(X_train, y_train)
         xgb_probs = xgb.predict_proba(X_test)[:, 1]
@@ -342,7 +392,6 @@ def run_ablation_study(
             "specificity": _specificity(y_test, xgb_preds),
         }
 
-    # Print summary table
     print(f"\n{'─'*62}")
     print(f"  {'Model':<15} {'AUC':>8} {'F1':>8} {'Sens':>8} {'Spec':>8}")
     print(f"{'─'*62}")
@@ -379,12 +428,12 @@ def save_model(model: KANFIS, path: str) -> None:
         "group_map":  model.group_map,
         "n_features": model.n_features,
     }, path)
-    print(f"[Save] Model saved to {path}")
+    print(f"  [Save] Model saved to {path}")
 
 
 def load_model(path: str) -> KANFIS:
     ckpt  = torch.load(path, map_location="cpu")
     model = build_kanfis(ckpt["n_features"], ckpt["group_map"])
     model.load_state_dict(ckpt["state_dict"])
-    print(f"[Load] Model loaded from {path}")
+    print(f"  [Load] Model loaded from {path}")
     return model
