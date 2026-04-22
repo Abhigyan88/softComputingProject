@@ -115,7 +115,7 @@ def _compute_firing_diagnostics(model: KANFIS, loader: DataLoader,
     for X_batch, _ in loader:
         X_batch = X_batch.to(device)
         logit, fz = model(X_batch, return_rules=True)
-        all_centroids.append(fz["centroid"].cpu())
+        all_centroids.append(fz.cpu())
         all_probs.append(torch.sigmoid(logit).cpu())
 
     centroids = torch.cat(all_centroids, dim=0)  # (N, n_rules)
@@ -172,21 +172,9 @@ def evaluate(
 # 2.  SENSITIVITY-CONSTRAINED THRESHOLD SEARCH
 # ─────────────────────────────────────────────
 
-def post_train_threshold_search(
-    probs: np.ndarray, 
-    labels: np.ndarray, 
-    min_sensitivity: float = 0.75
-) -> tuple:
-    """
-    Optimizes the decision threshold to maximize F2-Score (precision+recall balance)
-    while strictly maintaining the minimum sensitivity floor.
-    """
+def post_train_threshold_search(probs, labels, min_sensitivity=0.75):
     import numpy as np
-    
-    best_thr = 0.5
-    max_score = -1.0
-    best_sens = 0.0
-    best_spec = 0.0
+    best_thr, max_score, best_sens, best_spec = 0.5, -1.0, 0.0, 0.0
 
     for thr in np.linspace(0.01, 0.99, 99):
         preds = (probs >= thr).astype(int)
@@ -200,7 +188,7 @@ def post_train_threshold_search(
         prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
 
         if sens >= min_sensitivity:
-            # Optimize F2 Score instead of raw specificity to rescue precision
+            # Optimize F2 Score to balance Recall and Precision
             f2 = (5 * prec * sens) / ((4 * prec) + sens) if (prec + sens) > 0 else 0.0
             if f2 > max_score:
                 max_score = f2
@@ -438,12 +426,12 @@ def run_ablation_study(
     group_map: dict,
     alpha_pos: float = 0.75,
     min_sensitivity: float = 0.75,
-    spread_weight: float = 0.5,        # FIX 5
+    spread_weight: float = 0.5,
 ) -> dict:
-    """Evaluates KANFIS against standard baselines."""
+    """Evaluates KANFIS against standard baselines, now including Precision."""
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.neural_network import MLPClassifier
-    from sklearn.metrics import roc_auc_score, f1_score
+    from sklearn.metrics import roc_auc_score, f1_score, fbeta_score
     try:
         from xgboost import XGBClassifier
         has_xgb = True
@@ -486,13 +474,14 @@ def run_ablation_study(
         "f1":          f1_score(y_test, mlp_preds, zero_division=0),
         "sensitivity": _sensitivity(y_test, mlp_preds),
         "specificity": _specificity(y_test, mlp_preds),
+        "precision":   _precision(y_test, mlp_preds),
     }
 
     # 5c. Random Forest
     print("[Ablation] Training Random Forest...")
     rf = RandomForestClassifier(
         n_estimators=200, random_state=42, n_jobs=-1,
-        class_weight="balanced",   # handles class imbalance
+        class_weight="balanced",
     )
     rf.fit(X_train, y_train)
     rf_probs = rf.predict_proba(X_test)[:, 1]
@@ -504,12 +493,12 @@ def run_ablation_study(
         "f1":          f1_score(y_test, rf_preds, zero_division=0),
         "sensitivity": _sensitivity(y_test, rf_preds),
         "specificity": _specificity(y_test, rf_preds),
+        "precision":   _precision(y_test, rf_preds),
     }
 
     # 5d. XGBoost
     if has_xgb:
         print("[Ablation] Training XGBoost...")
-        # Compute scale_pos_weight for class imbalance
         neg, pos = np.bincount(y_train.astype(int))
         xgb = XGBClassifier(
             n_estimators=200, eval_metric="logloss",
@@ -527,17 +516,18 @@ def run_ablation_study(
             "f1":          f1_score(y_test, xgb_preds, zero_division=0),
             "sensitivity": _sensitivity(y_test, xgb_preds),
             "specificity": _specificity(y_test, xgb_preds),
+            "precision":   _precision(y_test, xgb_preds),
         }
 
-    print(f"\n{'─'*68}")
-    print(f"  {'Model':<22} {'AUC':>7} {'F2':>7} {'Sens':>7} {'Spec':>7}")
-    print(f"{'─'*68}")
+    print(f"\n{'─'*78}")
+    print(f"  {'Model':<22} {'AUC':>7} {'F2':>7} {'Sens':>7} {'Spec':>7} {'Prec':>7}")
+    print(f"{'─'*78}")
     for name, m in results.items():
         print(
             f"  {name:<22} {m['auc']:>7.4f} {m.get('f2',0):>7.4f} "
-            f"{m['sensitivity']:>7.4f} {m['specificity']:>7.4f}"
+            f"{m['sensitivity']:>7.4f} {m['specificity']:>7.4f} {m.get('precision', 0):>7.4f}"
         )
-    print(f"{'─'*68}")
+    print(f"{'─'*78}")
     return results
 
 
@@ -545,10 +535,16 @@ def run_ablation_study(
 # HELPERS
 # ─────────────────────────────────────────────
 def _sensitivity(y_true, y_pred):
+    from sklearn.metrics import recall_score
     return recall_score(y_true, y_pred, pos_label=1, zero_division=0)
 
 def _specificity(y_true, y_pred):
+    from sklearn.metrics import recall_score
     return recall_score(y_true, y_pred, pos_label=0, zero_division=0)
+
+def _precision(y_true, y_pred):
+    from sklearn.metrics import precision_score
+    return precision_score(y_true, y_pred, zero_division=0)
 
 def _get_device(device_str: str) -> torch.device:
     if device_str == "auto":

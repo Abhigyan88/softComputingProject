@@ -97,29 +97,22 @@ def extract_rules(
     feature_names: list,
     active_threshold: float = 0.01,
 ) -> list:
-    """
-    FIX 1 — Rule extraction now operates correctly in feature space.
-    """
     centres = model.fuzzy_layer.centres.detach().cpu().numpy()
     
-    # FIX: Calculate effective rule weights for the 2-layer MLP rule head
-    W_hid = model.rule_head.hidden.weight.detach().cpu().numpy()
-    W_out = model.rule_head.output.weight.detach().cpu().numpy()
-    weights = np.dot(W_out, W_hid).squeeze(0)
+    # Exact 1-to-1 mapping of rule weights
+    weights = model.rule_head.rule_weights.weight.detach().cpu().numpy().squeeze(0)
 
     active_rule_indices = [i for i, w in enumerate(weights) if abs(w) >= active_threshold]
-
     rules = []
+    
     for r_idx in active_rule_indices:
         rule_centres = centres[r_idx]   
         weight_val   = float(weights[r_idx])
 
         antecedents = []
         for f_idx, fname in enumerate(feature_names):
-            if f_idx >= len(rule_centres):
-                break
+            if f_idx >= len(rule_centres): break
             z_val = float(rule_centres[f_idx])
-            
             if abs(z_val) > 0.5:
                 term = _z_to_linguistic(fname, z_val)
                 antecedents.append((fname, term, z_val))
@@ -131,10 +124,8 @@ def extract_rules(
             antecedents.append((feature_names[strongest_f], term, z_val))
 
         rules.append({
-            "rule_idx":    r_idx,
-            "weight":      weight_val,
-            "antecedents": antecedents,
-            "raw_centres": rule_centres,
+            "rule_idx": r_idx, "weight": weight_val,
+            "antecedents": antecedents, "raw_centres": rule_centres,
         })
 
     rules.sort(key=lambda r: abs(r["weight"]), reverse=True)
@@ -490,11 +481,7 @@ def _plot_calibration(labels, raw_probs, cal_probs, output_dir,
 
 
 def _plot_rule_weights(model: KANFIS, output_dir: str):
-    # FIX: Calculate effective rule weights for the 2-layer MLP rule head
-    W_hid = model.rule_head.hidden.weight.detach().cpu().numpy()
-    W_out = model.rule_head.output.weight.detach().cpu().numpy()
-    weights = np.dot(W_out, W_hid).squeeze(0)
-    
+    weights = model.rule_head.rule_weights.weight.detach().cpu().numpy().squeeze(0)
     indices = np.arange(len(weights))
     colors  = ["#2563EB" if w > 0 else "#DC2626" for w in weights]
     
@@ -503,7 +490,7 @@ def _plot_rule_weights(model: KANFIS, output_dir: str):
     plt.axhline(0, color="black", lw=0.8)
     plt.xlabel("Rule Index")
     plt.ylabel("Consequent Weight")
-    plt.title("KANFIS Rule Weights (after L1 Pruning)\nBlue=Diabetic Risk, Red=Protective")
+    plt.title("KANFIS Rule Weights (Blue=Diabetic Risk, Red=Protective)")
     blue_p = mpatches.Patch(color="#2563EB", label="Positive (diabetic risk)")
     red_p  = mpatches.Patch(color="#DC2626", label="Negative (protective)")
     plt.legend(handles=[blue_p, red_p])
