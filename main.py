@@ -1,31 +1,16 @@
 """
-main.py  (v4 — v5 model defaults)
+main.py  (v6 — precision & interpretability optimized)
 =======
 Orchestrates the complete KANFIS research pipeline.
 
-CHANGELOG vs v3:
-
-  UPD 1 — New CLI arg: --spread_weight (default 0.5).
-           Controls the output-spread bonus in composite_loss (FIX 5 in model).
-           Higher values more aggressively prevent probability collapse.
-
-  UPD 2 — Default l1_lambda reduced: 1e-3 → 5e-4.
-           Paired with the new mean-L1 penalty in v5 model; 5e-4 provides
-           similar effective regularisation to 1e-3 with the old sum penalty.
-
-  UPD 3 — Default diversity_weight reduced: 0.1 → 0.05.
-           In v4 training, diversity loss collapsed to ≈0 by epoch 15 because
-           the IT2 centres (in Z-score space) naturally spread out under the
-           gated aggregation.  0.1 was creating a large penalty on legitimate
-           centre configurations; 0.05 is more appropriate.
-
-  UPD 4 — Default epochs increased: 150 → 200.
-           OneCycleLR (v4 train.py) benefits from more epochs, especially
-           the 60-epoch warmup + extended annealing phase.
-
-  UPD 5 — Summary block updated to include firing_var diagnostic.
-
-  Retained from v3: IMP 1–5.
+CHANGELOG vs v4/v5:
+  UPD 1 — Defaults updated to rescue precision and prevent rule collapse:
+           l1_lambda: 5e-4 -> 5e-5
+           focal_gamma: 2.0 -> 3.0
+           alpha_pos: 0.75 -> 0.5
+           diversity_weight: 0.05 -> 0.2
+           spread_weight: 0.5 -> 0.0
+           epochs: 200 -> 250
 """
 
 import argparse
@@ -47,7 +32,7 @@ from evaluate import full_evaluation, cross_population_test
 # ─────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser(
-        description="KANFIS — Kolmogorov-Arnold Neuro-Fuzzy Inference System (v4 orchestrator)"
+        description="KANFIS — Kolmogorov-Arnold Neuro-Fuzzy Inference System (v6 orchestrator)"
     )
     p.add_argument("--diabd",       type=str, required=True,
                    help="Path to DiaBD CSV file (primary dataset)")
@@ -59,16 +44,14 @@ def parse_args():
                    help="Run ablation study (KANFIS vs DNN, RF, XGBoost)")
     p.add_argument("--cv",          action="store_true",
                    help="Run 5-fold cross-validation")
-    p.add_argument("--epochs",      type=int,   default=200)          # UPD 4
+    p.add_argument("--epochs",      type=int,   default=250)          
     p.add_argument("--n_rules",     type=int,   default=10)
-    p.add_argument("--l1_lambda",   type=float, default=5e-4)         # UPD 2
-    p.add_argument("--focal_gamma", type=float, default=2.0)
-    p.add_argument("--alpha_pos",   type=float, default=0.75)
+    p.add_argument("--l1_lambda",   type=float, default=5e-5)         
+    p.add_argument("--focal_gamma", type=float, default=3.0)
+    p.add_argument("--alpha_pos",   type=float, default=0.5)
     p.add_argument("--min_sensitivity", type=float, default=0.75)
-    p.add_argument("--diversity_weight", type=float, default=0.05)    # UPD 3
-    p.add_argument("--spread_weight",    type=float, default=0.5,     # UPD 1
-                   help="Output-spread bonus weight (FIX 5 in v5 model). "
-                        "Penalises probability collapse; 0.5 is a safe default.")
+    p.add_argument("--diversity_weight", type=float, default=0.2)    
+    p.add_argument("--spread_weight",    type=float, default=0.0)     
     p.add_argument("--impute_strategy", type=str, default="mice",
                    choices=["mice", "knn"])
     p.add_argument("--no_xgb_filter", action="store_true",
@@ -85,7 +68,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     print("\n" + "█"*65)
-    print("  KANFIS — Diabetes Diagnostics  (v5 model / v4 orchestrator)")
+    print("  KANFIS — Diabetes Diagnostics  (v6 model / orchestrator)")
     print("  Abhigyan Pandey (22075001) & Shivansh Kandpal (22075083)")
     print("█"*65)
     print(f"\n  Config: epochs={args.epochs} | n_rules={args.n_rules} | "
@@ -122,7 +105,7 @@ def main():
     # ══════════════════════════════════════════════
     # PHASE 2+3 — TRAINING
     # ══════════════════════════════════════════════
-    print("\n▶ Phase 2+3: Architectural Construction & Training (v5 model)")
+    print("\n▶ Phase 2+3: Architectural Construction & Training (v6 model)")
     model, history, ts, opt_thr = train_kanfis(
         X_train, y_train, X_test, y_test,
         group_map=group_map,
@@ -131,7 +114,7 @@ def main():
         focal_gamma=args.focal_gamma,
         alpha_pos=args.alpha_pos,
         diversity_weight=args.diversity_weight,
-        spread_weight=args.spread_weight,            # UPD 1
+        spread_weight=args.spread_weight,            
         epochs=args.epochs,
         batch_size=64,
         lr=1e-3,
@@ -263,7 +246,7 @@ def _save_history(history, path, temperature: float = 1.0,
 
 def _print_summary(metrics: dict, opt_thr: float):
     print("\n" + "═"*65)
-    print("  KANFIS v5 — Final Results Summary")
+    print("  KANFIS v6 — Final Results Summary")
     print("═"*65)
     print(f"  ROC-AUC   : {metrics['auc']:.4f}")
     print(f"  Avg Prec  : {metrics['ap']:.4f}")

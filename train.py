@@ -171,45 +171,47 @@ def evaluate(
 # ─────────────────────────────────────────────
 # 2.  SENSITIVITY-CONSTRAINED THRESHOLD SEARCH
 # ─────────────────────────────────────────────
+
 def post_train_threshold_search(
-    probs: np.ndarray,
-    labels: np.ndarray,
-    min_sensitivity: float = 0.75,
+    probs: np.ndarray, 
+    labels: np.ndarray, 
+    min_sensitivity: float = 0.75
 ) -> tuple:
     """
-    Find the decision threshold that achieves at least min_sensitivity
-    while maximising specificity.  Falls back to Youden's J if target
-    sensitivity is unreachable.
+    Optimizes the decision threshold to maximize F2-Score (precision+recall balance)
+    while strictly maintaining the minimum sensitivity floor.
     """
-    from sklearn.metrics import roc_curve
-    fpr, tpr, thresholds = roc_curve(labels, probs)
+    import numpy as np
+    
+    best_thr = 0.5
+    max_score = -1.0
+    best_sens = 0.0
+    best_spec = 0.0
 
-    candidates = [
-        (float(thr), float(tpr_i), float(1 - fpr_i))
-        for tpr_i, fpr_i, thr in zip(tpr, fpr, thresholds)
-        if tpr_i >= min_sensitivity
-    ]
+    for thr in np.linspace(0.01, 0.99, 99):
+        preds = (probs >= thr).astype(int)
+        tp = np.sum((preds == 1) & (labels == 1))
+        fp = np.sum((preds == 1) & (labels == 0))
+        fn = np.sum((preds == 0) & (labels == 1))
+        tn = np.sum((preds == 0) & (labels == 0))
 
-    if candidates:
-        best = max(candidates, key=lambda c: c[2])
-        print(
-            f"  [ThresholdSearch] target sens≥{min_sensitivity:.2f} → "
-            f"threshold={best[0]:.3f}  "
-            f"(sensitivity={best[1]:.3f}, specificity={best[2]:.3f})"
-        )
-        return best
-    else:
-        j_scores = tpr - fpr
-        best_idx = int(np.argmax(j_scores))
-        thr  = float(thresholds[best_idx])
-        sens = float(tpr[best_idx])
-        spec = float(1 - fpr[best_idx])
-        print(
-            f"  [ThresholdSearch] ⚠ Could not reach sensitivity={min_sensitivity:.2f}. "
-            f"Falling back to Youden's J → "
-            f"threshold={thr:.3f}  (sens={sens:.3f}, spec={spec:.3f})"
-        )
-        return thr, sens, spec
+        sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+
+        if sens >= min_sensitivity:
+            # Optimize F2 Score instead of raw specificity to rescue precision
+            f2 = (5 * prec * sens) / ((4 * prec) + sens) if (prec + sens) > 0 else 0.0
+            if f2 > max_score:
+                max_score = f2
+                best_thr = thr
+                best_sens = sens
+                best_spec = spec
+
+    print(f"  [Threshold Search] min_sens={min_sensitivity:.2f} -> opt_thr={best_thr:.3f} "
+          f"(Max F2={max_score:.3f}, Sens={best_sens:.3f}, Spec={best_spec:.3f})")
+    
+    return float(best_thr), float(best_sens), float(best_spec)
 
 
 # ─────────────────────────────────────────────
