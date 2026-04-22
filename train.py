@@ -44,6 +44,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import average_precision_score
 from sklearn.metrics import (
     roc_auc_score, f1_score, fbeta_score,
     accuracy_score, recall_score, precision_score,
@@ -157,6 +158,7 @@ def evaluate(
 
     return {
         "auc":         roc_auc_score(labels, probs),
+        "ap":          average_precision_score(labels, probs), # NEW
         "f1":          f1_score(labels, preds, zero_division=0),
         "f2":          fbeta_score(labels, preds, beta=2, zero_division=0),
         "accuracy":    accuracy_score(labels, preds),
@@ -177,10 +179,6 @@ def post_train_threshold_search(
     labels: np.ndarray, 
     min_sensitivity: float = 0.75
 ) -> tuple:
-    """
-    Optimizes the decision threshold to maximize F2-Score (precision+recall balance)
-    while strictly maintaining the minimum sensitivity floor.
-    """
     import numpy as np
     
     best_thr = 0.5
@@ -200,16 +198,16 @@ def post_train_threshold_search(
         prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
 
         if sens >= min_sensitivity:
-            # Optimize F2 Score instead of raw specificity to rescue precision
-            f2 = (5 * prec * sens) / ((4 * prec) + sens) if (prec + sens) > 0 else 0.0
-            if f2 > max_score:
-                max_score = f2
+            # FIX: Optimize F1 Score instead of F2 to rescue precision
+            f1 = (2 * prec * sens) / (prec + sens) if (prec + sens) > 0 else 0.0
+            if f1 > max_score:
+                max_score = f1
                 best_thr = thr
                 best_sens = sens
                 best_spec = spec
 
     print(f"  [Threshold Search] min_sens={min_sensitivity:.2f} -> opt_thr={best_thr:.3f} "
-          f"(Max F2={max_score:.3f}, Sens={best_sens:.3f}, Spec={best_spec:.3f})")
+          f"(Max F1={max_score:.3f}, Sens={best_sens:.3f}, Spec={best_spec:.3f})")
     
     return float(best_thr), float(best_sens), float(best_spec)
 
@@ -286,7 +284,7 @@ def train_kanfis(
         final_div_factor=1e3,
     )
 
-    best_f2    = -1.0
+    best_f1   = -1.0
     best_state = copy.deepcopy(model.state_dict())
     no_improve = 0
     history    = []
@@ -320,8 +318,9 @@ def train_kanfis(
         }
         history.append(row)
 
-        if val_metrics["f2"] > best_f2:
-            best_f2    = val_metrics["f2"]
+        # INSIDE train_kanfis() loop
+        if val_metrics["f1"] > best_f1: # Changed from f2
+            best_f1    = val_metrics["f1"]
             best_state = copy.deepcopy(model.state_dict())
             no_improve = 0
         else:
@@ -349,7 +348,7 @@ def train_kanfis(
             break
 
     model.load_state_dict(best_state)
-    print(f"  [Train] Best val F2 = {best_f2:.4f}")
+    print(f"  [Train] Best val F1 = {best_f1:.4f}")
 
     # Post-training: sensitivity-constrained threshold search on val set
     val_ds2    = TensorDataset(torch.FloatTensor(X_val), torch.FloatTensor(y_val))

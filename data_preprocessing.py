@@ -200,23 +200,18 @@ def balance_classes(
     y: np.ndarray,
     strategy: str = "smote_tomek",
     random_state: int = 42,
+    target_ratio: float = 0.6,  # NEW: 0.6 means Positives will be 60% of Negatives
 ) -> tuple:
-    """
-    FIX 5: SMOTE k_neighbors increased from 3 → 5 (sklearn default).
-    k=3 creates overly tight synthetic samples; k=5 generalises better.
-    """
     print(f"  [Balance] Strategy: {strategy}")
     print(f"  [Balance] Before: {dict(zip(*np.unique(y, return_counts=True)))}")
 
     if strategy == "smote_tomek":
         sampler = SMOTETomek(
-            smote=SMOTE(k_neighbors=5, random_state=random_state),  # FIX 5
+            smote=SMOTE(k_neighbors=5, random_state=random_state, sampling_strategy=target_ratio),
             random_state=random_state,
         )
-    elif strategy == "adasyn":
-        sampler = ADASYN(n_neighbors=5, random_state=random_state)
     elif strategy == "smote":
-        sampler = SMOTE(k_neighbors=5, random_state=random_state)   # FIX 5
+        sampler = SMOTE(k_neighbors=5, random_state=random_state, sampling_strategy=target_ratio)
     else:
         raise ValueError(f"Unknown balancing strategy: {strategy}")
 
