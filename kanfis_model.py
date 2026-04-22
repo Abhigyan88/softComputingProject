@@ -309,27 +309,14 @@ class KANFIS(nn.Module):
 
     # ── IMP 2: Rule diversity loss ───────────────────────────────────────
     def _rule_diversity_loss(self, min_distance: float = 0.5) -> torch.Tensor:
-        """
-        IMP 2 — Penalise pairs of fuzzy rule centres that are too similar.
-
-        Why this matters:
-          Without diversity regularisation, multiple rules learn to fire
-          on nearly identical patient profiles (e.g. all "high BMI + high glucose").
-          The rule weight chart showed 7 near-identical protective bars, which is
-          symptomatic of this collapse. Diversity loss pushes centres apart so
-          each rule specialises on a DIFFERENT clinical sub-population.
-
-        Implementation:
-          Computes pairwise L2 distances between rule centre vectors.
-          Penalises any pair closer than min_distance (in Z-score units).
-          Only the upper triangle is counted (avoids double-counting).
-        """
-        c    = self.fuzzy_layer.centres                         # (n_rules, in_dim)
-        diff = c.unsqueeze(0) - c.unsqueeze(1)                  # (n,n,d)
-        dist = diff.pow(2).sum(-1).sqrt()                       # (n,n)
-        # relu(min_dist - dist): positive only when pair is too close
-        penalty = F.relu(min_distance - dist).triu(diagonal=1).mean()
-        return penalty
+            c    = self.fuzzy_layer.centres                         
+            diff = c.unsqueeze(0) - c.unsqueeze(1)                  
+            
+            # FIX: Add 1e-8 before sqrt to prevent NaN gradients on the diagonal
+            dist = (diff.pow(2).sum(-1) + 1e-8).sqrt()                       
+            
+            penalty = F.relu(min_distance - dist).triu(diagonal=1).mean()
+            return penalty
 
     # ── IMP 1: Focal Loss composite ──────────────────────────────────────
     def composite_loss(
