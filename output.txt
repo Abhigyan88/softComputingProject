@@ -1,0 +1,383 @@
+
+█████████████████████████████████████████████████████████████████
+  KANFIS — Diabetes Diagnostics  (v6 model / orchestrator)
+  Abhigyan Pandey (22075001) & Shivansh Kandpal (22075083)
+█████████████████████████████████████████████████████████████████
+
+  Config: epochs=250 | n_rules=10 | focal_γ=3.0 | α_pos=0.5
+  λ_L1=5e-05 | diversity_w=0.2 | spread_w=0.0
+  Sensitivity target: ≥0.75 | Impute: mice | XGB filter: True
+
+▶ Phase 1: Data Harmonisation & Preprocessing (v4 — richer features)
+
+============================================================
+  KANFIS Preprocessing Pipeline  (v4 — richer features)
+============================================================
+  [Engineer] Added 8 features: ['log_glucose', 'log_bmi', 'GlucoseBMI', 'AgeBMI', 'HyperGlucose', 'VascularRiskScore', 'MetabolicBurden', 'CardioFlag']
+  [Impute] MICE — fit on train, transform test (no leakage)  ✓
+  [Balance] Strategy: smote_tomek
+  [Balance] Before: {np.int64(0): np.int64(3956), np.int64(1): np.int64(274)}
+  [Balance] After : {np.int64(0): np.int64(3941), np.int64(1): np.int64(3941)}
+  [XGB Pre-filter] 6 features retained: ['gender', 'glucose', 'family_diabetes', 'hypertensive', 'family_hypertension', 'CardioFlag']
+  [RFE] 6 features selected: ['gender', 'glucose', 'family_diabetes', 'hypertensive', 'family_hypertension', 'CardioFlag']
+
+  [Pipeline] Final shapes → Train: (7882, 6), Test: (1058, 6)
+  [Pipeline] Groups: {'demographic': 1, 'metabolic': 2, 'cardiovascular': 3}
+  [ClassDist] Test set: negative=990 (93.6%), positive=68 (6.4%)
+
+  Selected features (6): ['gender', 'glucose', 'family_diabetes', 'hypertensive', 'family_hypertension', 'CardioFlag']
+
+▶ Phase 2+3: Architectural Construction & Training (v6 model)
+  [Train] Device: cuda
+  [Train] epochs=250 | batch=64 | patience=50 | warmup=60 | OneCycleLR
+  Ep    1/250  loss=0.0810  AUC=0.7506  F2=0.0000  Sens=0.000  Spec=1.000  | firing_var=0.0068  prob_var=0.0003  p∈[0.39,0.46]  (1s)
+  Ep   10/250  loss=0.0240  AUC=0.7867  F2=0.4858  Sens=0.603  Spec=0.890  | firing_var=0.0075  prob_var=0.0054  p∈[0.35,0.68]  (6s)
+  Ep   20/250  loss=0.0209  AUC=0.7806  F2=0.4790  Sens=0.603  Spec=0.884  | firing_var=0.0095  prob_var=0.0065  p∈[0.32,0.69]  (12s)
+  Ep   30/250  loss=0.0206  AUC=0.7784  F2=0.4988  Sens=0.632  Spec=0.883  | firing_var=0.0102  prob_var=0.0077  p∈[0.30,0.71]  (17s)
+  Ep   40/250  loss=0.0201  AUC=0.7747  F2=0.4988  Sens=0.632  Spec=0.883  | firing_var=0.0105  prob_var=0.0078  p∈[0.30,0.71]  (24s)
+  Ep   50/250  loss=0.0200  AUC=0.7762  F2=0.4977  Sens=0.632  Spec=0.882  | firing_var=0.0106  prob_var=0.0078  p∈[0.30,0.73]  (30s)
+  Ep   60/250  loss=0.0200  AUC=0.7782  F2=0.4918  Sens=0.618  Spec=0.886  | firing_var=0.0108  prob_var=0.0074  p∈[0.31,0.71]  (36s)
+  [EarlyStop] No improvement for 50 epochs → stop at epoch 63
+  [Train] Best val F2 = 0.5122
+  [Threshold Search] min_sens=0.75 -> opt_thr=0.400 (Max F2=0.414, Sens=0.750, Spec=0.704)
+  [Save] Model saved to ./results/kanfis_final.pt
+  [Save] Training history → ./results/training_history.csv  (T=0.8456, thr=0.400)
+
+▶ Phase 4: Clinical Validation & Narrative Generation
+
+═════════════════════════════════════════════════════════════════
+  KANFIS — Evaluation Report  (v3)
+═════════════════════════════════════════════════════════════════
+  ROC-AUC    : 0.7803 (T=0.846 applied)
+  Avg Prec.  : 0.3208
+
+  ── At threshold = 0.50 (default) ──────────────────────
+  F1-Score   : 0.4078
+  F2-Score   : 0.5122
+  Sensitivity: 0.6176  (recall for diabetic class)
+  Specificity: 0.9030  (recall for non-diabetic class)
+  Precision  : 0.3043
+  Confusion  :
+[[894  96]
+ [ 26  42]]
+
+  ── At threshold = 0.400 (sensitivity-optimised) ────────
+  F1-Score   : 0.2800
+  F2-Score   : 0.4422
+  Sensitivity: 0.7206  ← target ≥ 0.75
+  Specificity: 0.7646
+  Precision  : 0.1738
+  Confusion  :
+[[757 233]
+ [ 19  49]]
+
+  ── Sensitivity Operating Point Analysis ──────────────
+   Threshold  Sensitivity  Specificity  Precision  F2-Score  Note
+  ──────────────────────────────────────────────────────────────────────
+        0.25       1.0000       0.0000     0.0643    0.2556 
+        0.30       1.0000       0.0000     0.0643    0.2556 
+        0.35       0.8088       0.4636     0.0939    0.3205 
+        0.40       0.7206       0.7646     0.1738    0.4422  ← optimal
+        0.45       0.6618       0.8475     0.2296    0.4808 
+        0.50       0.6176       0.9030     0.3043    0.5122 
+  ──────────────────────────────────────────────────────────────────────
+
+  Active rules after pruning : 10
+  Rule inference time        : 2.703 ms
+
+═════════════════════════════════════════════════════════════════
+  KANFIS — Extracted Clinical Decision Rules (v3 — FIX 1)
+═════════════════════════════════════════════════════════════════
+  Total active rules  : 10 (after L1 pruning)
+  Rule polarity       : 7 risk-positive / 3 protective
+
+Rule 1:
+  IF   gender is Female AND
+       glucose is Critically Elevated AND
+       family_diabetes is Elevated AND
+       hypertensive is Absent AND
+       family_hypertension is Elevated AND
+       CardioFlag is No Comorbidities
+  THEN Risk of Type-2 Diabetes is HIGH
+       (Weight = +0.4973, |Confidence| ∝ 0.4973)
+
+Rule 2:
+  IF   gender is Female AND
+       glucose is Critically Elevated AND
+       family_diabetes is Elevated AND
+       hypertensive is Present AND
+       family_hypertension is Elevated AND
+       CardioFlag is Comorbidities Present
+  THEN Risk of Type-2 Diabetes is HIGH
+       (Weight = +0.4695, |Confidence| ∝ 0.4695)
+
+Rule 3:
+  IF   gender is Male AND
+       glucose is Critically Elevated AND
+       family_hypertension is Elevated AND
+       CardioFlag is No Comorbidities
+  THEN Risk of Type-2 Diabetes is HIGH
+       (Weight = +0.4693, |Confidence| ∝ 0.4693)
+
+Rule 4:
+  IF   gender is Male AND
+       glucose is Normal AND
+       family_diabetes is Elevated AND
+       hypertensive is Present AND
+       family_hypertension is Elevated AND
+       CardioFlag is Comorbidities Present
+  THEN Risk of Type-2 Diabetes is HIGH
+       (Weight = +0.4406, |Confidence| ∝ 0.4406)
+
+Rule 5:
+  IF   gender is Male AND
+       glucose is Critically Elevated AND
+       family_diabetes is Elevated AND
+       hypertensive is Absent AND
+       family_hypertension is Elevated
+  THEN Risk of Type-2 Diabetes is HIGH
+       (Weight = +0.4285, |Confidence| ∝ 0.4285)
+
+Rule 6:
+  IF   glucose is Critically Elevated AND
+       family_diabetes is Elevated AND
+       hypertensive is Present AND
+       family_hypertension is Elevated AND
+       CardioFlag is No Comorbidities
+  THEN Risk of Type-2 Diabetes is PROTECTIVE / LOW
+       (Weight = -0.4131, |Confidence| ∝ 0.4131)
+
+Rule 7:
+  IF   gender is Male AND
+       glucose is Critically Elevated AND
+       hypertensive is Present AND
+       family_hypertension is Elevated AND
+       CardioFlag is Comorbidities Present
+  THEN Risk of Type-2 Diabetes is PROTECTIVE / LOW
+       (Weight = -0.3956, |Confidence| ∝ 0.3956)
+
+  [Plot] ROC curve saved.
+  [Plot] PR curve saved.
+  [Plot] Calibration curve saved.
+  [Plot] Rule weights saved.
+  [Plot] Sensitivity/Specificity curve saved.
+
+═════════════════════════════════════════════════════════════════
+  KANFIS v6 — Final Results Summary
+═════════════════════════════════════════════════════════════════
+  ROC-AUC   : 0.7803
+  Avg Prec  : 0.3208
+
+  Metric            @0.50 (default)     @0.400 (optimal)
+  ───────────────────────────────────────────────────────
+  Sensitivity                0.6176               0.7206
+  Specificity                0.9030               0.7646
+  Precision                  0.3043               0.1738
+  F1-Score                   0.4078               0.2800
+  F2-Score                   0.5122               0.4422
+  ───────────────────────────────────────────────────────
+  Threshold shift Δ: sensitivity +0.1029, specificity -0.1384
+
+▶ Running 5-Fold Cross-Validation...
+
+============================================================
+  Stratified 5-Fold Cross-Validation
+============================================================
+
+--- Fold 1/5 ---
+  [Train] Device: cuda
+  [Train] epochs=250 | batch=64 | patience=50 | warmup=60 | OneCycleLR
+  Ep    1/250  loss=0.0914  AUC=0.8562  F2=0.0000  Sens=0.000  Spec=1.000  | firing_var=0.0115  prob_var=0.0003  p∈[0.38,0.44]  (1s)
+  Ep   10/250  loss=0.0258  AUC=0.9392  F2=0.8308  Sens=0.816  Spec=0.921  | firing_var=0.0121  prob_var=0.0149  p∈[0.36,0.70]  (5s)
+  Ep   20/250  loss=0.0214  AUC=0.9451  F2=0.8350  Sens=0.820  Spec=0.926  | firing_var=0.0156  prob_var=0.0258  p∈[0.33,0.82]  (10s)
+  Ep   30/250  loss=0.0207  AUC=0.9471  F2=0.8493  Sens=0.843  Spec=0.904  | firing_var=0.0164  prob_var=0.0334  p∈[0.32,0.87]  (15s)
+  Ep   40/250  loss=0.0203  AUC=0.9500  F2=0.8553  Sens=0.850  Spec=0.903  | firing_var=0.0161  prob_var=0.0358  p∈[0.32,0.90]  (21s)
+  Ep   50/250  loss=0.0200  AUC=0.9508  F2=0.8579  Sens=0.849  Spec=0.920  | firing_var=0.0160  prob_var=0.0384  p∈[0.32,0.91]  (26s)
+  Ep   60/250  loss=0.0201  AUC=0.9515  F2=0.8782  Sens=0.880  Spec=0.894  | firing_var=0.0160  prob_var=0.0411  p∈[0.31,0.93]  (32s)
+  Ep   70/250  loss=0.0197  AUC=0.9512  F2=0.8467  Sens=0.833  Spec=0.931  | firing_var=0.0162  prob_var=0.0425  p∈[0.31,0.94]  (38s)
+  Ep   80/250  loss=0.0198  AUC=0.9527  F2=0.8590  Sens=0.849  Spec=0.925  | firing_var=0.0164  prob_var=0.0444  p∈[0.31,0.94]  (43s)
+  Ep   90/250  loss=0.0198  AUC=0.9516  F2=0.8416  Sens=0.824  Spec=0.942  | firing_var=0.0165  prob_var=0.0451  p∈[0.31,0.95]  (48s)
+  Ep  100/250  loss=0.0196  AUC=0.9525  F2=0.8659  Sens=0.858  Spec=0.923  | firing_var=0.0169  prob_var=0.0476  p∈[0.30,0.95]  (53s)
+  Ep  110/250  loss=0.0193  AUC=0.9517  F2=0.8507  Sens=0.838  Spec=0.930  | firing_var=0.0172  prob_var=0.0478  p∈[0.31,0.96]  (58s)
+  [EarlyStop] No improvement for 50 epochs → stop at epoch 110
+  [Train] Best val F2 = 0.8782
+  [Threshold Search] min_sens=0.75 -> opt_thr=0.390 (Max F2=0.904, Sens=0.940, Spec=0.791)
+  Fold 1 @0.50 → AUC=0.9515  F2=0.8782  Sens=0.8801  Spec=0.8936
+  Fold 1 @0.39 → Sens=0.9401  Spec=0.7913
+
+--- Fold 2/5 ---
+  [Train] Device: cuda
+  [Train] epochs=250 | batch=64 | patience=50 | warmup=60 | OneCycleLR
+  Ep    1/250  loss=0.0847  AUC=0.8514  F2=0.0217  Sens=0.017  Spec=0.999  | firing_var=0.0111  prob_var=0.0008  p∈[0.39,0.51]  (1s)
+  Ep   10/250  loss=0.0244  AUC=0.9187  F2=0.8255  Sens=0.815  Spec=0.900  | firing_var=0.0096  prob_var=0.0185  p∈[0.33,0.74]  (5s)
+  Ep   20/250  loss=0.0207  AUC=0.9244  F2=0.8360  Sens=0.833  Spec=0.879  | firing_var=0.0121  prob_var=0.0288  p∈[0.31,0.83]  (10s)
+  Ep   30/250  loss=0.0201  AUC=0.9262  F2=0.8285  Sens=0.817  Spec=0.909  | firing_var=0.0136  prob_var=0.0343  p∈[0.29,0.87]  (16s)
+  Ep   40/250  loss=0.0197  AUC=0.9273  F2=0.8483  Sens=0.848  Spec=0.878  | firing_var=0.0146  prob_var=0.0373  p∈[0.31,0.89]  (21s)
+  Ep   50/250  loss=0.0196  AUC=0.9277  F2=0.8287  Sens=0.813  Spec=0.925  | firing_var=0.0151  prob_var=0.0382  p∈[0.31,0.90]  (26s)
+  Ep   60/250  loss=0.0196  AUC=0.9278  F2=0.8278  Sens=0.813  Spec=0.921  | firing_var=0.0154  prob_var=0.0392  p∈[0.30,0.91]  (31s)
+  Ep   70/250  loss=0.0194  AUC=0.9290  F2=0.8300  Sens=0.820  Spec=0.901  | firing_var=0.0158  prob_var=0.0387  p∈[0.32,0.92]  (36s)
+  Ep   80/250  loss=0.0193  AUC=0.9283  F2=0.8265  Sens=0.809  Spec=0.930  | firing_var=0.0162  prob_var=0.0412  p∈[0.30,0.93]  (41s)
+  Ep   90/250  loss=0.0191  AUC=0.9283  F2=0.8189  Sens=0.803  Spec=0.919  | firing_var=0.0168  prob_var=0.0430  p∈[0.30,0.93]  (46s)
+  [EarlyStop] No improvement for 50 epochs → stop at epoch 96
+  [Train] Best val F2 = 0.8518
+  [Threshold Search] min_sens=0.75 -> opt_thr=0.360 (Max F2=0.868, Sens=0.929, Spec=0.658)
+  Fold 2 @0.50 → AUC=0.9278  F2=0.8518  Sens=0.8529  Spec=0.8753
+  Fold 2 @0.36 → Sens=0.9289  Spec=0.6582
+
+--- Fold 3/5 ---
+  [Train] Device: cuda
+  [Train] epochs=250 | batch=64 | patience=50 | warmup=60 | OneCycleLR
+  Ep    1/250  loss=0.0962  AUC=0.8781  F2=0.0000  Sens=0.000  Spec=1.000  | firing_var=0.0060  prob_var=0.0003  p∈[0.38,0.45]  (1s)
+  Ep   10/250  loss=0.0358  AUC=0.9281  F2=0.8461  Sens=0.840  Spec=0.898  | firing_var=0.0097  prob_var=0.0157  p∈[0.36,0.71]  (5s)
+  Ep   20/250  loss=0.0218  AUC=0.9326  F2=0.8297  Sens=0.817  Spec=0.915  | firing_var=0.0126  prob_var=0.0270  p∈[0.32,0.81]  (10s)
+  Ep   30/250  loss=0.0204  AUC=0.9333  F2=0.8513  Sens=0.847  Spec=0.898  | firing_var=0.0134  prob_var=0.0324  p∈[0.31,0.86]  (15s)
+  Ep   40/250  loss=0.0202  AUC=0.9330  F2=0.8335  Sens=0.824  Spec=0.903  | firing_var=0.0132  prob_var=0.0352  p∈[0.30,0.88]  (20s)
+  Ep   50/250  loss=0.0203  AUC=0.9334  F2=0.8304  Sens=0.818  Spec=0.913  | firing_var=0.0131  prob_var=0.0381  p∈[0.29,0.89]  (25s)
+  Ep   60/250  loss=0.0200  AUC=0.9349  F2=0.8545  Sens=0.849  Spec=0.903  | firing_var=0.0130  prob_var=0.0383  p∈[0.30,0.90]  (31s)
+  Ep   70/250  loss=0.0198  AUC=0.9347  F2=0.8363  Sens=0.823  Spec=0.921  | firing_var=0.0131  prob_var=0.0403  p∈[0.29,0.91]  (36s)
+  Ep   80/250  loss=0.0198  AUC=0.9350  F2=0.8354  Sens=0.822  Spec=0.922  | firing_var=0.0131  prob_var=0.0412  p∈[0.30,0.92]  (41s)
+  Ep   90/250  loss=0.0200  AUC=0.9349  F2=0.8532  Sens=0.848  Spec=0.902  | firing_var=0.0132  prob_var=0.0424  p∈[0.30,0.93]  (46s)
+  Ep  100/250  loss=0.0195  AUC=0.9347  F2=0.8304  Sens=0.813  Spec=0.933  | firing_var=0.0134  prob_var=0.0441  p∈[0.30,0.93]  (51s)
+  [EarlyStop] No improvement for 50 epochs → stop at epoch 106
+  [Train] Best val F2 = 0.8618
+  [Threshold Search] min_sens=0.75 -> opt_thr=0.440 (Max F2=0.880, Sens=0.900, Spec=0.827)
+  Fold 3 @0.50 → AUC=0.9347  F2=0.8618  Sens=0.8616  Spec=0.8884
+  Fold 3 @0.44 → Sens=0.9002  Spec=0.8266
+
+--- Fold 4/5 ---
+  [Train] Device: cuda
+  [Train] epochs=250 | batch=64 | patience=50 | warmup=60 | OneCycleLR
+  Ep    1/250  loss=0.0909  AUC=0.7909  F2=0.0000  Sens=0.000  Spec=1.000  | firing_var=0.0086  prob_var=0.0001  p∈[0.38,0.42]  (1s)
+  Ep   10/250  loss=0.0272  AUC=0.9381  F2=0.8202  Sens=0.803  Spec=0.925  | firing_var=0.0120  prob_var=0.0164  p∈[0.32,0.73]  (5s)
+  Ep   20/250  loss=0.0212  AUC=0.9417  F2=0.8459  Sens=0.838  Spec=0.907  | firing_var=0.0157  prob_var=0.0278  p∈[0.29,0.83]  (11s)
+  Ep   30/250  loss=0.0206  AUC=0.9428  F2=0.8516  Sens=0.844  Spec=0.909  | firing_var=0.0157  prob_var=0.0324  p∈[0.30,0.87]  (16s)
+  Ep   40/250  loss=0.0201  AUC=0.9440  F2=0.8512  Sens=0.843  Spec=0.912  | firing_var=0.0158  prob_var=0.0361  p∈[0.31,0.90]  (21s)
+  Ep   50/250  loss=0.0200  AUC=0.9450  F2=0.8487  Sens=0.837  Spec=0.925  | firing_var=0.0158  prob_var=0.0384  p∈[0.30,0.91]  (26s)
+  Ep   60/250  loss=0.0198  AUC=0.9454  F2=0.8428  Sens=0.829  Spec=0.927  | firing_var=0.0161  prob_var=0.0399  p∈[0.30,0.93]  (31s)
+  Ep   70/250  loss=0.0196  AUC=0.9472  F2=0.8516  Sens=0.842  Spec=0.919  | firing_var=0.0164  prob_var=0.0419  p∈[0.31,0.93]  (37s)
+  Ep   80/250  loss=0.0196  AUC=0.9466  F2=0.8477  Sens=0.834  Spec=0.930  | firing_var=0.0165  prob_var=0.0431  p∈[0.30,0.94]  (42s)
+  [EarlyStop] No improvement for 50 epochs → stop at epoch 88
+  [Train] Best val F2 = 0.8691
+  [Threshold Search] min_sens=0.75 -> opt_thr=0.380 (Max F2=0.896, Sens=0.939, Spec=0.757)
+  Fold 4 @0.50 → AUC=0.9442  F2=0.8691  Sens=0.8691  Spec=0.8935
+  Fold 4 @0.38 → Sens=0.9389  Spec=0.7566
+
+--- Fold 5/5 ---
+  [Train] Device: cuda
+  [Train] epochs=250 | batch=64 | patience=50 | warmup=60 | OneCycleLR
+  Ep    1/250  loss=0.1029  AUC=0.8649  F2=0.0000  Sens=0.000  Spec=1.000  | firing_var=0.0071  prob_var=0.0003  p∈[0.38,0.46]  (1s)
+  Ep   10/250  loss=0.0304  AUC=0.9273  F2=0.8578  Sens=0.854  Spec=0.899  | firing_var=0.0116  prob_var=0.0182  p∈[0.35,0.73]  (5s)
+  Ep   20/250  loss=0.0210  AUC=0.9348  F2=0.8496  Sens=0.844  Spec=0.900  | firing_var=0.0149  prob_var=0.0303  p∈[0.33,0.84]  (11s)
+  Ep   30/250  loss=0.0203  AUC=0.9371  F2=0.8441  Sens=0.834  Spec=0.913  | firing_var=0.0153  prob_var=0.0344  p∈[0.32,0.87]  (16s)
+  Ep   40/250  loss=0.0202  AUC=0.9387  F2=0.8484  Sens=0.840  Spec=0.909  | firing_var=0.0159  prob_var=0.0391  p∈[0.32,0.90]  (21s)
+  Ep   50/250  loss=0.0197  AUC=0.9390  F2=0.8407  Sens=0.828  Spec=0.922  | firing_var=0.0160  prob_var=0.0418  p∈[0.31,0.91]  (27s)
+  Ep   60/250  loss=0.0197  AUC=0.9402  F2=0.8395  Sens=0.824  Spec=0.931  | firing_var=0.0163  prob_var=0.0434  p∈[0.31,0.92]  (32s)
+  Ep   70/250  loss=0.0196  AUC=0.9397  F2=0.8361  Sens=0.820  Spec=0.930  | firing_var=0.0166  prob_var=0.0452  p∈[0.30,0.93]  (37s)
+  Ep   80/250  loss=0.0195  AUC=0.9416  F2=0.8386  Sens=0.822  Spec=0.937  | firing_var=0.0169  prob_var=0.0455  p∈[0.31,0.93]  (43s)
+  Ep   90/250  loss=0.0194  AUC=0.9417  F2=0.8391  Sens=0.823  Spec=0.934  | firing_var=0.0170  prob_var=0.0462  p∈[0.31,0.94]  (48s)
+  [EarlyStop] No improvement for 50 epochs → stop at epoch 91
+  [Train] Best val F2 = 0.8750
+  [Threshold Search] min_sens=0.75 -> opt_thr=0.360 (Max F2=0.886, Sens=0.948, Spec=0.676)
+  Fold 5 @0.50 → AUC=0.9397  F2=0.8750  Sens=0.8778  Spec=0.8874
+  Fold 5 @0.36 → Sens=0.9476  Spec=0.6765
+
+────────────────────────────────────────────────────────────
+  CV Results (5 folds, at sensitivity-optimised threshold):
+    auc         : 0.9396 ± 0.0081
+    f2          : 0.8871 ± 0.0125
+    sensitivity : 0.9312 ± 0.0166
+    specificity : 0.7418 ± 0.0650
+
+▶ Running Ablation Study (KANFIS vs baselines)...
+
+[Ablation] Training KANFIS...
+  [Train] Device: cuda
+  [Train] epochs=150 | batch=64 | patience=50 | warmup=60 | OneCycleLR
+  Ep    1/150  loss=0.1130  AUC=0.7894  F2=0.0000  Sens=0.000  Spec=1.000  | firing_var=0.0047  prob_var=0.0001  p∈[0.38,0.43]  (1s)
+  Ep   10/150  loss=0.0474  AUC=0.7839  F2=0.4963  Sens=0.588  Spec=0.908  | firing_var=0.0116  prob_var=0.0080  p∈[0.30,0.77]  (6s)
+  Ep   20/150  loss=0.0411  AUC=0.7849  F2=0.4965  Sens=0.632  Spec=0.881  | firing_var=0.0128  prob_var=0.0122  p∈[0.26,0.81]  (11s)
+  Ep   30/150  loss=0.0401  AUC=0.7851  F2=0.4717  Sens=0.588  Spec=0.887  | firing_var=0.0121  prob_var=0.0127  p∈[0.24,0.80]  (17s)
+  Ep   40/150  loss=0.0395  AUC=0.7796  F2=0.4801  Sens=0.603  Spec=0.885  | firing_var=0.0115  prob_var=0.0125  p∈[0.25,0.80]  (22s)
+  Ep   50/150  loss=0.0388  AUC=0.7843  F2=0.4722  Sens=0.574  Spec=0.897  | firing_var=0.0113  prob_var=0.0122  p∈[0.25,0.79]  (28s)
+  Ep   60/150  loss=0.0387  AUC=0.7849  F2=0.4930  Sens=0.618  Spec=0.887  | firing_var=0.0110  prob_var=0.0128  p∈[0.26,0.81]  (33s)
+  [EarlyStop] No improvement for 50 epochs → stop at epoch 65
+  [Train] Best val F2 = 0.5023
+  [Threshold Search] min_sens=0.75 -> opt_thr=0.350 (Max F2=0.413, Sens=0.765, Spec=0.691)
+[Ablation] Training MLP...
+  [Threshold Search] min_sens=0.75 -> opt_thr=0.250 (Max F2=0.445, Sens=0.750, Spec=0.747)
+[Ablation] Training Random Forest...
+  [Threshold Search] min_sens=0.75 -> opt_thr=0.090 (Max F2=0.443, Sens=0.750, Spec=0.744)
+[Ablation] Training XGBoost...
+  [Threshold Search] min_sens=0.75 -> opt_thr=0.160 (Max F2=0.443, Sens=0.750, Spec=0.744)
+
+──────────────────────────────────────────────────────────────────────────────
+  Model                      AUC      F2    Sens    Spec    Prec
+──────────────────────────────────────────────────────────────────────────────
+  KANFIS@0.5              0.7861  0.5023  0.6471  0.8768  0.2651
+  KANFIS@0.35             0.7861  0.4127  0.7647  0.6909  0.1453
+  MLP@0.25                0.7845  0.4450  0.7500  0.7475  0.1694
+  RF@0.09                 0.7671  0.4427  0.7500  0.7444  0.1678
+  XGB@0.16                0.7673  0.4427  0.7500  0.7444  0.1678
+──────────────────────────────────────────────────────────────────────────────
+  [Save] Ablation results → ./results/ablation_results.csv
+
+▶ Running Cross-Population Validation (Pima Bias test)...
+
+============================================================
+  KANFIS Preprocessing Pipeline  (v4 — richer features)
+============================================================
+  [Impute] MICE — fit on train, transform test (no leakage)  ✓
+  [Balance] Strategy: smote_tomek
+  [Balance] Before: {np.int64(0): np.int64(400), np.int64(1): np.int64(214)}
+  [Balance] After : {np.int64(0): np.int64(383), np.int64(1): np.int64(383)}
+  [XGB Pre-filter] 6 features retained: ['Pregnancies', 'Glucose', 'Insulin', 'BMI', 'DiabetesPedigreeFunction', 'Age']
+  [RFE] 6 features selected: ['Pregnancies', 'Glucose', 'Insulin', 'BMI', 'DiabetesPedigreeFunction', 'Age']
+
+  [Pipeline] Final shapes → Train: (766, 6), Test: (154, 6)
+  [Pipeline] Groups: {'hormonal': 2, 'metabolic': 3, 'demographic': 1}
+  [ClassDist] Test set: negative=100 (64.9%), positive=54 (35.1%)
+  Training PIDD-baseline model...
+  [Train] Device: cuda
+  [Train] epochs=250 | batch=64 | patience=50 | warmup=60 | OneCycleLR
+  Ep    1/250  loss=0.0753  AUC=0.5533  F2=0.0000  Sens=0.000  Spec=1.000  | firing_var=0.0115  prob_var=0.0000  p∈[0.37,0.39]  (0s)
+  Ep   10/250  loss=0.0593  AUC=0.7969  F2=0.0000  Sens=0.000  Spec=1.000  | firing_var=0.0111  prob_var=0.0002  p∈[0.39,0.45]  (1s)
+  Ep   20/250  loss=0.0487  AUC=0.7976  F2=0.0000  Sens=0.000  Spec=1.000  | firing_var=0.0110  prob_var=0.0008  p∈[0.40,0.50]  (1s)
+  Ep   30/250  loss=0.0429  AUC=0.7970  F2=0.5513  Sens=0.537  Spec=0.820  | firing_var=0.0108  prob_var=0.0018  p∈[0.41,0.54]  (2s)
+  Ep   40/250  loss=0.0395  AUC=0.8017  F2=0.7193  Sens=0.759  Spec=0.720  | firing_var=0.0103  prob_var=0.0030  p∈[0.41,0.56]  (2s)
+  Ep   50/250  loss=0.0371  AUC=0.8102  F2=0.7069  Sens=0.759  Spec=0.670  | firing_var=0.0101  prob_var=0.0041  p∈[0.40,0.58]  (3s)
+  Ep   60/250  loss=0.0353  AUC=0.8165  F2=0.7241  Sens=0.778  Spec=0.680  | firing_var=0.0101  prob_var=0.0052  p∈[0.39,0.60]  (4s)
+  Ep   70/250  loss=0.0335  AUC=0.8235  F2=0.7292  Sens=0.778  Spec=0.700  | firing_var=0.0103  prob_var=0.0064  p∈[0.38,0.61]  (4s)
+  Ep   80/250  loss=0.0326  AUC=0.8231  F2=0.7586  Sens=0.815  Spec=0.700  | firing_var=0.0108  prob_var=0.0077  p∈[0.37,0.62]  (5s)
+  Ep   90/250  loss=0.0314  AUC=0.8257  F2=0.7639  Sens=0.815  Spec=0.720  | firing_var=0.0115  prob_var=0.0092  p∈[0.35,0.63]  (6s)
+  Ep  100/250  loss=0.0304  AUC=0.8256  F2=0.7639  Sens=0.815  Spec=0.720  | firing_var=0.0123  prob_var=0.0109  p∈[0.33,0.64]  (6s)
+  Ep  110/250  loss=0.0299  AUC=0.8259  F2=0.7692  Sens=0.815  Spec=0.740  | firing_var=0.0131  prob_var=0.0123  p∈[0.32,0.65]  (7s)
+  Ep  120/250  loss=0.0292  AUC=0.8226  F2=0.7570  Sens=0.796  Spec=0.750  | firing_var=0.0138  prob_var=0.0137  p∈[0.31,0.66]  (7s)
+  Ep  130/250  loss=0.0281  AUC=0.8215  F2=0.7570  Sens=0.796  Spec=0.750  | firing_var=0.0145  prob_var=0.0148  p∈[0.29,0.67]  (8s)
+  Ep  140/250  loss=0.0282  AUC=0.8209  F2=0.7746  Sens=0.815  Spec=0.760  | firing_var=0.0151  prob_var=0.0165  p∈[0.28,0.68]  (9s)
+  Ep  150/250  loss=0.0276  AUC=0.8220  F2=0.7719  Sens=0.815  Spec=0.750  | firing_var=0.0157  prob_var=0.0177  p∈[0.27,0.69]  (9s)
+  Ep  160/250  loss=0.0272  AUC=0.8180  F2=0.7570  Sens=0.796  Spec=0.750  | firing_var=0.0162  prob_var=0.0187  p∈[0.26,0.69]  (10s)
+  Ep  170/250  loss=0.0265  AUC=0.8194  F2=0.7570  Sens=0.796  Spec=0.750  | firing_var=0.0167  prob_var=0.0200  p∈[0.25,0.70]  (10s)
+  Ep  180/250  loss=0.0262  AUC=0.8194  F2=0.7570  Sens=0.796  Spec=0.750  | firing_var=0.0170  prob_var=0.0206  p∈[0.24,0.71]  (11s)
+  Ep  190/250  loss=0.0262  AUC=0.8189  F2=0.7420  Sens=0.778  Spec=0.750  | firing_var=0.0174  prob_var=0.0211  p∈[0.24,0.72]  (12s)
+  [EarlyStop] No improvement for 50 epochs → stop at epoch 190
+  [Train] Best val F2 = 0.7746
+  [Threshold Search] min_sens=0.75 -> opt_thr=0.410 (Max F2=0.806, Sens=0.907, Spec=0.610)
+  [Note] For full cross-population test, align PIDD & DiaBD feature spaces.
+
+═════════════════════════════════════════════════════════════════
+  Cross-Population Validation (Pima Bias Quantification)
+═════════════════════════════════════════════════════════════════
+  PIDD-trained model on DiaBD  : AUC = 0.7545
+  KANFIS (DiaBD-trained)       : AUC = 0.7803
+  Improvement (ΔAUC)           : +0.0258
+  ✓ KANFIS demonstrates improved cross-population generalizability
+
+✓ All outputs saved to: ./results/
+  • kanfis_final.pt          — trained model weights
+  • training_history.csv     — per-epoch metrics (includes spread)
+  • roc_curve.png            — ROC + optimal operating point
+  • pr_curve.png             — Precision-Recall curve
+  • calibration.png          — Raw vs calibrated + threshold line
+  • rule_weights.png         — Rule weight bar chart
+  • sensitivity_curve.png    — Sensitivity/Specificity vs threshold
+  • ablation_results.csv     — Ablation comparison table
