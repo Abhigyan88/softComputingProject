@@ -59,14 +59,21 @@ Binary Output: Diabetic / Non-Diabetic
 ## File Structure
 
 ```
-kanfis_project/
+project/
 ├── data_preprocessing.py  # Phase 1: imputation, balancing, normalisation, feature selection
 ├── kanfis_model.py        # Phase 2: GroupKANLayer, IT2FuzzyLayer, SparseRuleHead, KANFIS
 ├── train.py               # Phase 3: training loop, K-fold CV, ablation study
 ├── evaluate.py            # Phase 4: metrics, rule extraction, clinical narratives
 ├── main.py                # Orchestration entry point
 ├── requirements.txt
-└── README.md
+├── README.md
+├── data/
+│   ├── diabd.csv          # DiaBD dataset (Bangladeshi cohort)
+│   └── pima.csv           # PIDD dataset (Pima Indians)
+└── results/
+    ├── ablation_results.csv
+    ├── kanfis_final.pt
+    └── training_history.csv
 ```
 
 ---
@@ -83,24 +90,24 @@ pip install -r requirements.txt
 
 ### Basic training + evaluation
 ```bash
-python main.py --diabd path/to/diabd.csv
+python main.py --diabd data/diabd.csv
 ```
 
 ### With 5-fold cross-validation
 ```bash
-python main.py --diabd path/to/diabd.csv --cv
+python main.py --diabd data/diabd.csv --cv
 ```
 
 ### With ablation study (KANFIS vs DNN / RF / XGBoost)
 ```bash
-python main.py --diabd path/to/diabd.csv --ablation
+python main.py --diabd data/diabd.csv --ablation
 ```
 
 ### Full pipeline including Pima Bias cross-population test
 ```bash
 python main.py \
-  --diabd  path/to/diabd.csv \
-  --pidd   path/to/pima.csv \
+  --diabd  data/diabd.csv \
+  --pidd   data/pima.csv \
   --cross_pop \
   --ablation \
   --cv \
@@ -114,7 +121,10 @@ python main.py \
 
 ## Dataset Setup
 
+The datasets are already provided in the `data/` folder.
+
 ### Primary — DiaBD (Bangladeshi cohort)
+Located at: `data/diabd.csv`  
 Download from: https://www.kaggle.com/datasets/hassinarman/diabetes-bangladesh  
 or: https://data.mendeley.com/datasets/rn9m3zb7nt
 
@@ -123,6 +133,7 @@ SkinThickness, SystolicBP, DiastolicBP, Hypertension, HeartDisease,
 IschemicStroke, VisionComplications, DurationDiabetes, Outcome`
 
 ### Baseline — PIDD
+Located at: `data/pima.csv`  
 Download from: https://www.kaggle.com/datasets/uciml/pima-indians-diabetes-database  
 Expected columns: `Pregnancies, Glucose, BloodPressure, SkinThickness,
 Insulin, BMI, DiabetesPedigreeFunction, Age, Outcome`
