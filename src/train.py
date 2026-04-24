@@ -551,17 +551,32 @@ def _get_device(device_str: str) -> torch.device:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device_str)
 
-def save_model(model: KANFIS, path: str) -> None:
-    torch.save({
+def save_model(model: KANFIS, path: str, ts=None, opt_threshold: float = None) -> None:
+    # BUG 1 FIX: persist n_rules so load_model can reconstruct the exact architecture.
+    # BUG 4 FIX: persist temperature scalar and optimal threshold so inference.py can
+    #            produce calibrated, threshold-consistent probabilities.
+    ckpt = {
         "state_dict": model.state_dict(),
         "group_map":  model.group_map,
         "n_features": model.n_features,
-    }, path)
-    print(f"  [Save] Model saved to {path}")
+        "n_rules":    model.fuzzy_layer.centres.shape[0],
+    }
+    if ts is not None:
+        ckpt["temperature"]    = ts.temperature.item()
+    if opt_threshold is not None:
+        ckpt["opt_threshold"]  = float(opt_threshold)
+    torch.save(ckpt, path)
+    print(f"  [Save] Model saved to {path}  "
+          f"(n_rules={ckpt['n_rules']}, "
+          f"T={ckpt.get('temperature', 1.0):.4f}, "
+          f"thr={ckpt.get('opt_threshold', 'n/a')})")
 
 def load_model(path: str) -> KANFIS:
     ckpt  = torch.load(path, map_location="cpu")
-    model = build_kanfis(ckpt["n_features"], ckpt["group_map"])
+    # BUG 1 FIX: infer n_rules from checkpoint; fall back to centres shape for
+    #            checkpoints saved before this fix was applied.
+    n_rules = ckpt.get("n_rules", ckpt["state_dict"]["fuzzy_layer.centres"].shape[0])
+    model   = build_kanfis(ckpt["n_features"], ckpt["group_map"], n_rules=n_rules)
     model.load_state_dict(ckpt["state_dict"])
-    print(f"  [Load] Model loaded from {path}")
+    print(f"  [Load] Model loaded from {path}  (n_rules={n_rules})")
     return model

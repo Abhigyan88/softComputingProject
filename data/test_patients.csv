@@ -1,0 +1,11 @@
+age,gender,pulse_rate,systolic_bp,diastolic_bp,glucose,bmi,family_diabetes,hypertensive,family_hypertension,cardiovascular_disease,stroke,diabetic
+58,male,88,145,92,210,32.4,1,1,1,1,0,yes
+34,female,72,115,75,92,21.8,0,0,0,0,0,no
+47,male,80,130,85,165,28.9,1,0,1,0,0,yes
+62,female,90,155,98,240,35.7,1,1,1,1,1,yes
+28,female,68,110,70,88,20.1,0,0,0,0,0,no
+51,male,85,135,88,140,30.2,1,1,0,0,0,yes
+38,female,75,118,78,98,24.3,0,0,1,0,0,no
+55,male,82,148,94,195,33.1,1,1,1,1,0,yes
+42,female,78,122,80,110,26.5,0,0,0,0,0,no
+67,male,92,160,100,230,36.8,1,1,1,1,1,yes

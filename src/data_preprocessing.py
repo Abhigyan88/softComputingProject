@@ -474,14 +474,18 @@ def run_preprocessing_pipeline(
     _print_class_dist("Test set", y_test)
 
     return {
-        "X_train":       X_train_n.astype(np.float32),
-        "y_train":       np.array(y_train_bal, dtype=np.float32),
-        "X_test":        X_test_n.astype(np.float32),
-        "y_test":        np.array(y_test, dtype=np.float32),
-        "feature_names": selected_names,
-        "group_map":     group_map,
-        "scaler":        scaler,
-        "imputer":       imputer,
+        "X_train":           X_train_n.astype(np.float32),
+        "y_train":           np.array(y_train_bal, dtype=np.float32),
+        "X_test":            X_test_n.astype(np.float32),
+        "y_test":            np.array(y_test, dtype=np.float32),
+        "feature_names":     selected_names,
+        # SCALER FIX: scaler was fitted on ALL engineered features before XGB/RFECV
+        # selection.  Inference must transform the full set first, then slice.
+        # This key records the full ordered column list the scaler expects.
+        "all_feature_names": feature_names_all,
+        "group_map":         group_map,
+        "scaler":            scaler,
+        "imputer":           imputer,
     }
 
 

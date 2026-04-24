@@ -129,7 +129,11 @@ class KANFIS(nn.Module):
         firing = torch.clamp(centroid + kan_correction, 0.0, 1.0)
         
         logit = self.rule_head(firing)
-        return (logit, centroid) if return_rules else logit
+        # BUG 3 FIX: return post-KAN clamped firing (same value used to compute logit),
+        # not the raw centroid.  explain_sample() multiplies these by rule_weights to
+        # get contributions — using centroid here produced attributions for a different
+        # computation than the one that generated the prediction.
+        return (logit, firing) if return_rules else logit
 
     def composite_loss(self, logit: torch.Tensor, targets: torch.Tensor, l1_scale: float = 1.0) -> tuple:
         targets_f = targets.float()

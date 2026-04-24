@@ -79,6 +79,7 @@ def main():
           f"Impute: {args.impute_strategy} | "
           f"XGB filter: {not args.no_xgb_filter}")
 
+
     # ══════════════════════════════════════════════
     # PHASE 1 — PREPROCESSING
     # ══════════════════════════════════════════════
@@ -102,6 +103,20 @@ def main():
 
     print(f"\n  Selected features ({len(feature_names)}): {feature_names}")
 
+    import joblib, json
+    joblib.dump(data["scaler"], os.path.join(args.output_dir, "scaler.pkl"))
+    with open(os.path.join(args.output_dir, "feature_names.json"), "w") as _f:
+        json.dump(feature_names, _f)
+    # SCALER FIX: save the full pre-selection feature list so inference.py can
+    # transform the complete engineered feature matrix before slicing to the
+    # selected subset — matching exactly what the scaler was fitted on.
+    with open(os.path.join(args.output_dir, "all_feature_names.json"), "w") as _f:
+        json.dump(data["all_feature_names"], _f)
+    print(f"  [Save] Scaler → {args.output_dir}/scaler.pkl")
+    print(f"  [Save] Feature names → {args.output_dir}/feature_names.json")
+    print(f"  [Save] All feature names ({len(data['all_feature_names'])}) → "
+          f"{args.output_dir}/all_feature_names.json")
+    
     # ══════════════════════════════════════════════
     # PHASE 2+3 — TRAINING
     # ══════════════════════════════════════════════
@@ -122,7 +137,9 @@ def main():
         min_sensitivity=args.min_sensitivity,
     )
 
-    save_model(model, os.path.join(args.output_dir, "kanfis_final.pt"))
+    # BUG 1+4 FIX: pass ts and opt_thr so the checkpoint is self-contained
+    save_model(model, os.path.join(args.output_dir, "kanfis_final.pt"),
+               ts=ts, opt_threshold=opt_thr)
     _save_history(
         history,
         os.path.join(args.output_dir, "training_history.csv"),
