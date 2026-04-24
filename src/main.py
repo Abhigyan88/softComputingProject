@@ -19,12 +19,12 @@ import sys
 import torch
 import numpy as np
 
-from data_preprocessing import (
+from src.data_preprocessing import (
     run_preprocessing_pipeline, DIABD_COLS, PIDD_COLS
 )
-from kanfis_model import build_kanfis
-from train import train_kanfis, cross_validate_kanfis, run_ablation_study, save_model
-from evaluate import full_evaluation, cross_population_test
+from src.kanfis_model import build_kanfis
+from src.train import train_kanfis, cross_validate_kanfis, run_ablation_study, save_model
+from src.evaluate import full_evaluation, cross_population_test
 
 
 # ─────────────────────────────────────────────

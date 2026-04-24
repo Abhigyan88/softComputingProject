@@ -40,7 +40,7 @@ from sklearn.metrics import (
     f1_score, fbeta_score, recall_score, precision_score,
 )
 from sklearn.calibration import calibration_curve
-from kanfis_model import KANFIS, TemperatureScaling
+from src.kanfis_model import KANFIS, TemperatureScaling
 
 
 # ─────────────────────────────────────────────

@@ -20,7 +20,7 @@ import joblib
 import os
 
 try:
-    from kanfis_model import KANFIS, build_kanfis
+    from src.kanfis_model import KANFIS, build_kanfis
 except ImportError:
     sys.exit(
         "ERROR: Cannot import kanfis_model.py. "

@@ -48,7 +48,7 @@ from sklearn.metrics import (
     roc_auc_score, f1_score, fbeta_score,
     accuracy_score, recall_score, precision_score,
 )
-from kanfis_model import KANFIS, build_kanfis, calibrate_temperature
+from src.kanfis_model import KANFIS, build_kanfis, calibrate_temperature
 
 
 # ─────────────────────────────────────────────
